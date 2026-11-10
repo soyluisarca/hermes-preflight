@@ -103,7 +103,7 @@ print("PASS 7: discard no tocó el workspace real y limpió la sesión")
 
 # --- 8) guardas: sudo bloqueado; ruta absoluta fuera bloqueada ---
 r_sudo = env.execute("sudo rm -rf /")
-assert r_sudo["exit_code"] == 1 and "sudo" in r_sudo["output"].lower()
+assert r_sudo["exit_code"] == 1 and ("privilegios elevados" in r_sudo["output"].lower() or "bloqueado" in r_sudo["output"].lower())
 print("PASS 8: sudo bloqueado")
 
 # --- 9) symlink que escapa de la copia -> operación bloqueada ---

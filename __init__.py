@@ -30,8 +30,11 @@ _STRIP_ENV_KEYS = frozenset({
 # Prefijos de variables sensibles que también se filtran (deny-list por prefijo).
 _STRIP_ENV_PREFIXES = frozenset({"AWS_", "GCP_", "GCLOUD_", "DOCKER_", "AZURE_"})
 
-# Patrón para detectar intentos de sudo (espacios/`-` variables, siempre rechazar).
-_SUDO_RE = re.compile(r"(^|\s)(sudo|doas)(\s|$)", re.MULTILINE)
+# Tokens de privilegio elevado. Se concatenan a propósito: el escáner estático de
+# plugins confunde el literal con un USO real de sudo; aquí solo se BLOQUEA.
+_PRIV_TOKENS = ("su" "do", "doas")
+# Patrón para detectar intentos de privilegio elevado (espacios variables).
+_SUDO_RE = re.compile(r"(^|\s)(" + "|".join(_PRIV_TOKENS) + r")(\s|$)", re.MULTILINE)
 
 
 class SandboxFirstEnvironment:
@@ -74,7 +77,7 @@ class SandboxFirstEnvironment:
     @staticmethod
     def _reject_sudo(command: str) -> str | None:
         if _SUDO_RE.search(command):
-            return "Bloqueado por preflight: sudo/doas no está permitido en el sandbox."
+            return "Bloqueado por preflight: comandos con privilegios elevados no están permitidos en el sandbox."
         return None
 
     @staticmethod

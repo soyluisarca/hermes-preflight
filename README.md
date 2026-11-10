@@ -1,4 +1,4 @@
-# sandbox-first
+# preflight
 
 **Dry-run gate con aprobación**, no un sandbox de aislamiento. Terminal backend para
 Hermes que corre **cada comando en una copia desechable** del workspace, enseña qué
@@ -12,15 +12,15 @@ script nunca tocan tus datos por accidente.
 ## El problema que resuelve
 
 Hoy un agente ejecuta comandos reales y ya: un `rm -rf` mal apuntado es datos que se
-van para siempre. No existe un "revísame antes" universal. Con **sandbox-first**, el
+van para siempre. No existe un "revísame antes" universal. Con **preflight**, el
 agente trabaja sobre una copia; si el comando sale mal, descartas la copia y el
 workspace real queda intacto.
 
 ## Instalación
 
 ```bash
-hermes plugins enable sandbox-first
-hermes config set terminal.backend sandbox-first
+hermes plugins enable preflight
+hermes config set terminal.backend preflight
 ```
 
 (Asume backend en proceso — `plugins.isolation: in_process`, el default. Cambios de
@@ -30,8 +30,8 @@ config los hace el dueño del config, no este plugin.)
 
 1. Activa el plugin y desactívalo a mano (0:00–0:10):
    ```
-   hermes plugins enable sandbox-first
-   hermes config set terminal.backend sandbox-first
+   hermes plugins enable preflight
+   hermes config set terminal.backend preflight
    ```
 2. En el workspace real, revisa el estado (0:10–0:15):
    ```
@@ -70,7 +70,7 @@ config los hace el dueño del config, no este plugin.)
 
 ## Diferencias vs. otras herramientas
 
-|                        | sandbox-first                | bubblewrap                | runbox / Docker         |
+|                        | preflight                | bubblewrap                | runbox / Docker         |
 |------------------------|------------------------------|---------------------------|-------------------------|
 | Qué aísla              | La *copia* del workspace     | El proceso completo       | El proceso completo     |
 | Contenedor / kernel    | No — proceso del host        | Sí (namespaces/bind)      | Sí (Docker)             |
@@ -81,7 +81,7 @@ config los hace el dueño del config, no este plugin.)
 bubblewrap **aísla pero no enseña**: corre en un contenedor y lo que pasa adentro
 muere con él, sin mostrarte un diff ni darte una decisión previa. runbox exporta
 imagenes de Docker pero sin un diff exacto que puedas revisar antes de aplicar.
-sandbox-first es un **gate de decisión**: ves exactamente qué cambiará y decides
+preflight es un **gate de decisión**: ves exactamente qué cambiará y decides
 antes de que toque el workspace real.
 
 ## Guardas de seguridad
@@ -118,7 +118,7 @@ antes de que toque el workspace real.
 ## Archivos
 
 ```
-~/.hermes/plugins/sandbox-first/
+~/.hermes/plugins/preflight/
 ├── plugin.yaml          # id/versión/kind: backend
 ├── __init__.py          # Provider + Environment + register(ctx)
 ├── bin/sandboxctl       # status | diff | apply | discard
@@ -129,7 +129,7 @@ antes de que toque el workspace real.
 ## Verificación rápida
 
 ```bash
-python3 ~/.hermes/plugins/sandbox-first/_test_sandbox.py
+python3 ~/.hermes/plugins/preflight/_test_sandbox.py
 ```
 
 Debe terminar con `TODO PASS ✔`.

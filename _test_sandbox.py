@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test funcional de sandbox-first (MVP).
+"""Test funcional de preflight (MVP).
 
 Verifica:
   1. crear workspace temporal con 2 archivos en un subdir,
@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 REPO = Path("/home/lac71/.hermes/hermes-agent")
-PLUGIN_DIR = Path("/home/lac71/.hermes/plugins/sandbox-first")
+PLUGIN_DIR = Path("/home/lac71/.hermes/plugins/preflight")
 sys.path.insert(0, str(REPO))
 
 # Sandbox temporal aislado (no tocamos ~/.hermes/sandbox del usuario).

@@ -1,4 +1,4 @@
-"""sandbox-first: terminal backend que corre comandos en una copia desechable del workspace.
+"""preflight: terminal backend que corre comandos en una copia desechable del workspace.
 
 Cada comando se ejecuta en una copia local (reflink / copia completa) del workspace.
 El workspace real NO se toca. Tras cada comando se acumula un diff en PENDING.diff.
@@ -74,7 +74,7 @@ class SandboxFirstEnvironment:
     @staticmethod
     def _reject_sudo(command: str) -> str | None:
         if _SUDO_RE.search(command):
-            return "Bloqueado por sandbox-first: sudo/doas no está permitido en el sandbox."
+            return "Bloqueado por preflight: sudo/doas no está permitido en el sandbox."
         return None
 
     @staticmethod
@@ -115,7 +115,7 @@ class SandboxFirstEnvironment:
                 is_under = False
             if not is_under and target != "/dev/null":
                 return (
-                    f"Bloqueado por sandbox-first: redirección de escritura a ruta fuera de la "
+                    f"Bloqueado por preflight: redirección de escritura a ruta fuera de la "
                     f"copia ({target}). Nada se escribe fuera del sandbox."
                 )
         return None
@@ -147,7 +147,7 @@ class SandboxFirstEnvironment:
             shown = ", ".join(escaping[:5])
             more = f" y {len(escaping)-5} más" if len(escaping) > 5 else ""
             return (
-                "Bloqueado por sandbox-first: la copia contiene symlink(s) que escapan "
+                "Bloqueado por preflight: la copia contiene symlink(s) que escapan "
                 f"del sandbox ({shown}{more}). Elimínalos en el workspace real o usa un "
                 "workspace sin symlinks hacia fuera; así garantizamos que ningún comando "
                 "salga del sandbox por un symlink."
@@ -172,7 +172,7 @@ class SandboxFirstEnvironment:
         if paths:
             return {
                 "output": (
-                    "Bloqueado por sandbox-first: ruta(s) absoluta(s) fuera de la copia del "
+                    "Bloqueado por preflight: ruta(s) absoluta(s) fuera de la copia del "
                     f"sandbox: {', '.join(paths)}"
                 ),
                 "exit_code": 1,
@@ -236,7 +236,7 @@ class SandboxFirstEnvironment:
         body = (proc.stdout or "") + (proc.stderr or "")
         # diff sale con rc != 0 cuando hay diferencias (normal). No lo tratamos como error.
         header = (
-            f"# PENDING.diff — sandbox-first ({self.sandbox_path.name})\n"
+            f"# PENDING.diff — preflight ({self.sandbox_path.name})\n"
             f"# ORIGINAL : {self.original_path}\n"
             f"# SANDBOX  : {self.sandbox_path}\n"
             f"# Acumulado tras el último comando ejecutado.\n"
@@ -251,8 +251,8 @@ class SandboxFirstEnvironment:
 
 
 class SandboxFirstProvider(TerminalEnvironmentProvider):
-    name = "sandbox-first"
-    display_name = "Sandbox First"
+    name = "preflight"
+    display_name = "Preflight"
 
     # NO es un contenedor: el comando corre en una COPIA local (reflink/copia) del
     # workspace real. El proceso es del host; no hay aislamiento de kernel ni de red.

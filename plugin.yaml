@@ -1,0 +1,4 @@
+name: sandbox-first
+version: 0.1.0
+description: "Dry-run gate con aprobación: corre cada comando en una copia desechable del workspace (reflink/copia, aislada), muestra el diff exacto y solo aplica lo que apruebas."
+kind: backend

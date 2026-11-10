@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# sandboxctl — control de sesiones sandbox-first.
+# Uso: sandboxctl <status|diff|apply|discard> [task_id]
+#
+# apply    : rsync copia -> workspace real (SOLO los archivos del diff). Acción EXPLÍCITA.
+# discard  : borra la copia. El workspace real no se toca.
+# status   : lista sesiones existentes y su PENDING.diff.
+# diff     : imprime el PENDING.diff de una sesión.
+set -euo pipefail
+
+: "${SANDBOX_FIRST_ROOT:=${HOME}/.hermes/sandbox}"
+
+cmd="${1:-status}"
+task_id="${2:-}"
+
+if [[ "$cmd" == "status" ]]; then
+  echo "=== sandbox-first: sesiones ==="
+  if [[ ! -d "$SANDBOX_FIRST_ROOT" ]]; then
+    echo "  (no hay sesiones en $SANDBOX_FIRST_ROOT)"
+    exit 0
+  fi
+  for ws in "$SANDBOX_FIRST_ROOT"/*/workspace; do
+    [[ -d "$ws" ]] || continue
+    id="$(basename "$(dirname "$ws")")"
+    pending=0
+    if [[ -f "$ws/PENDING.diff" ]]; then
+      # líneas de diff reales (empezando por + / - / diff / Only / Index)
+      pending="$(grep -cE '^[+-]|^diff |^Only |^Index ' "$ws/PENDING.diff" || true)"
+    fi
+    echo "  $id  (cambios pendientes: $pending)"
+  done
+  exit 0
+fi
+
+[[ -n "$task_id" ]] || { echo "uso: sandboxctl $cmd <task_id>"; exit 2; }
+WS="$SANDBOX_FIRST_ROOT/$task_id/workspace"
+[[ -d "$WS" ]] || { echo "sesión no encontrada: $task_id"; exit 1; }
+
+ORIGIN_FILE="$SANDBOX_FIRST_ROOT/$task_id/original"
+[[ -f "$ORIGIN_FILE" ]] || { echo "falta el registro del workspace original de $task_id"; exit 1; }
+ORIG="$(cat "$ORIGIN_FILE")"
+[[ -d "$ORIG" ]] || { echo "workspace original inválido: $ORIG"; exit 1; }
+
+case "$cmd" in
+  diff)
+    [[ -f "$WS/PENDING.diff" ]] && cat "$WS/PENDING.diff" || echo "(sin PENDING.diff)"
+    ;;
+  apply)
+    echo "▶ Aplicando cambios de '$task_id' al workspace real..."
+    echo "  origen : $WS"
+    echo "  destino: $ORIG"
+    echo "  (estado del diff)"
+    [[ -f "$WS/PENDING.diff" ]] && grep -E '^[+-]|^diff |^Only |^Index ' "$WS/PENDING.diff" | head -n 60 || true
+    echo
+    read -r -p "¿Aplicar? esto SOBREESCRIBE el workspace real [s/N]: " ans
+    if [[ "$ans" =~ ^[sSyY]$ ]]; then
+      # --delete: los borrados del diff también se aplican. -a preserva metadatos.
+      rsync -a --delete --exclude=PENDING.diff "$WS/" "$ORIG/"
+      echo "✔ Aplicado."
+    else
+      echo "✖ Aplicación cancelada."
+      exit 1
+    fi
+    ;;
+  discard)
+    rm -rf -- "$SANDBOX_FIRST_ROOT/$task_id"
+    echo "✔ Sesión '$task_id' descartada (el workspace real no se tocó)."
+    ;;
+  *)
+    echo "comando desconocido: $cmd (status|diff|apply|discard)"
+    exit 2
+    ;;
+esac

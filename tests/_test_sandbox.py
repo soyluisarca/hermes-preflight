@@ -27,7 +27,7 @@ mod = {}
 plugin_path = PLUGIN_DIR / "__init__.py"
 exec(compile(plugin_path.read_text(), str(plugin_path), "exec"), mod)
 
-Provider = mod["SandboxFirstProvider"]
+Provider = mod["PreflightProvider"]
 provider = Provider()
 assert provider.is_available(), "bash no está disponible"
 

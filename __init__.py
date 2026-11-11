@@ -253,7 +253,7 @@ class SandboxFirstEnvironment:
         """Deja el sandbox intacto (no borra). El descarte es explícito (discard)."""
 
 
-class SandboxFirstProvider(TerminalEnvironmentProvider):
+class PreflightProvider(TerminalEnvironmentProvider):
     name = "preflight"
     display_name = "Preflight"
 
@@ -357,4 +357,4 @@ class SandboxFirstProvider(TerminalEnvironmentProvider):
 
 
 def register(ctx):
-    ctx.register_terminal_environment_provider(SandboxFirstProvider())
+    ctx.register_terminal_environment_provider(PreflightProvider())

@@ -12,6 +12,8 @@ set -euo pipefail
 
 cmd="${1:-status}"
 task_id="${2:-}"
+assume_yes=0
+for a in "$@"; do [[ "$a" == "--yes" || "$a" == "-y" ]] && assume_yes=1; done
 
 if [[ "$cmd" == "status" ]]; then
   echo "=== sandbox-first: sesiones ==="
@@ -52,7 +54,14 @@ case "$cmd" in
     echo "  (estado del diff)"
     [[ -f "$WS/PENDING.diff" ]] && grep -E '^[+-]|^diff |^Only |^Index ' "$WS/PENDING.diff" | head -n 60 || true
     echo
-    read -r -p "¿Aplicar? esto SOBREESCRIBE el workspace real [s/N]: " ans
+    if [[ "$assume_yes" -eq 1 ]]; then
+      ans=s
+    elif [[ ! -t 0 ]]; then
+      echo "✖ apply necesita confirmación: corre con --yes (o desde una terminal interactiva)." >&2
+      exit 2
+    else
+      read -r -p "¿Aplicar? esto SOBREESCRIBE el workspace real [s/N]: " ans
+    fi
     if [[ "$ans" =~ ^[sSyY]$ ]]; then
       # --delete: los borrados del diff también se aplican. -a preserva metadatos.
       rsync -a --delete --exclude=PENDING.diff "$WS/" "$ORIG/"

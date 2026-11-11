@@ -79,27 +79,31 @@ paths) or `discard`.
 - After each command it recomputes the diff original ↔ copy (`git diff
   --no-index` when there is a `.git`, `diff -ruN` otherwise) into
   `PENDING.diff`.
-- **Nothing applies on its own.** `apply` runs a **selective** sync — it copies
-  only the paths the diff changed and performs deletions **explicitly** (never a
-  global `--delete`). Before applying it rechecks a fingerprint of the real
-  workspace taken at clone time and **aborts if the real workspace changed**
-  since the session started (TOCTOU guard), reminding you to re-sync.
+- **Nothing applies on its own.** `apply` runs a sync of the copy into the real
+  workspace (no global `--delete`) after verifying a fingerprint that the real
+  workspace has not changed since the clone (TOCTOU); deletions are applied
+  explicitly and only for paths gone from the copy.
 
 ## Security guards (best-effort)
 
 - Rejects `sudo` / `doas`, including after shell separators (`x&&sudo`,
-  `(sudo …)`, `` `sudo …` ``).
+  `(sudo …)`, `` `sudo …` ``). The check normalizes the command first (quotes and
+  backslash escapes are stripped for the match), so wrappers like
+  `bash -c 'sudo …'` are caught too.
 - Rejects absolute paths that point **outside** the copy (including a bare `/`).
 - Rejects write redirections (`>`, `2>`) to paths outside the copy.
 - Rejects the operation if the copy contains **symlinks that escape** the
   sandbox (preserved by the clone; a symlink to `/etc` or `~/.ssh` would
   bypass the copy).
-- **Filtered environment**: secrets are removed from the subprocess — the
-  Hermes managed-secret sanitizer (the same one the local backend uses) plus
-  our own deny-list of exact keys and prefixes (`OPENROUTER_API_KEY`,
-  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SSH_AUTH_SOCK`, `AWS_*`,
-  `GCP_*`/`GCLOUD_*`, `DOCKER_*`, `AZURE_*`, `NPM_TOKEN`, `GH_TOKEN`/
-  `GITHUB_TOKEN`, `FAL_*`, `NOUS_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`).
+- **Filtered environment**: secrets are stripped from the subprocess using a
+  **local** deny-list (it does not re-use the core's sanitizer). It strips any
+  variable whose name starts with a sensitive prefix (`FAL_*`, `NOUS_*`,
+  `OPENROUTER_*`, `ANTHROPIC_*`, `OPENAI_*`, `AWS_*`, `GCP_*`, `GCLOUD_*`,
+  `AZURE_*`, `DOCKER_*`, `HF_*`, `HUGGINGFACE_*`, `MESHY_*`, `SUPABASE_*`),
+  ends with a sensitive pattern (`*_API_KEY`, `*_TOKEN`, `*_SECRET`,
+  `*_PASSWORD`, `*_CREDENTIAL`, `*_ACCESS_KEY`), or is an exact key
+  (`SSH_AUTH_SOCK`, `GOOGLE_APPLICATION_CREDENTIALS`, `NPM_TOKEN`, `GH_TOKEN`,
+  `GITHUB_TOKEN`, `NETRC`). All matching is case-insensitive.
 - `HOME` is pinned **inside the copy**, so `cd ~`, `~/.bashrc`, git config etc.
   never escape to the real user directory.
 - `skip_container_guards = False`: the model still goes through Hermes' approval
@@ -122,7 +126,8 @@ paths) or `discard`.
 
 - **Not a real kernel sandbox.** The shell runs on the host (the `cwd` is a
   copy). Path/sudo guards are best-effort pattern matching and a cleverer
-  nested shell could evade them.
+  nested shell could still evade them (e.g. `bash -c 'sudo …'` wrapped in
+  base64).
 - **The command has network access** — it is *not* a network-isolating sandbox.
 - **WSL /mnt/c is slow** — a Windows-linked path is slow to walk/copy; keep the
   workspace on a Linux filesystem (e.g. `~/`) for fast reflink clones.
@@ -145,6 +150,7 @@ paths) or `discard`.
 ├── __init__.py          # Provider + Environment + register(ctx)
 ├── bin/sandboxctl       # status | diff | apply | discard
 ├── tests/_test_sandbox.py # functional test (run: python3 tests/_test_sandbox.py)
+├── tests/_probe_leak.py    # leak regression probe (run: python3 tests/_probe_leak.py)
 └── README.md            # this file
 ```
 

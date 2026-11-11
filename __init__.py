@@ -40,6 +40,49 @@ _STRIP_ENV_KEYS = frozenset({
 # Sensitive variable prefixes also filtered (deny-list by prefix).
 _STRIP_ENV_PREFIXES = frozenset({"AWS_", "GCP_", "GCLOUD_", "DOCKER_", "AZURE_"})
 
+# --- local env sanitizer (no private core imports) ---
+# Sensitive prefixes stripped case-insensitively. Broader than the deny-list
+# above so Hermes-managed secrets (FAL_*, NOUS_API_KEY, ...) never reach a
+# child process even if they are not listed explicitly here.
+_STRIP_ENV_PREFIX = (
+    "FAL_", "NOUS_", "OPENROUTER_", "OPENAI_", "ANTHROPIC_", "GOOGLE_",
+    "GCP_", "GCLOUD_", "AWS_", "AZURE_", "DOCKER_", "HF_", "HUGGINGFACE_",
+    "MESHY_", "SUPABASE_", "LANGSMITH_", "ELEVENLABS_", "DEEPSEEK_", "GLM_",
+    "PORTAL_", "HERMES_",
+)
+# Sensitive suffixes stripped, again case-insensitive.
+_STRIP_ENV_SUFFIX = (
+    "_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIAL", "_ACCESS_KEY",
+)
+# Exact names always dropped (case-insensitive), e.g. git/registry/ssh creds.
+_STRIP_ENV_EXACT = frozenset({
+    "SSH_AUTH_SOCK", "GOOGLE_APPLICATION_CREDENTIALS", "NPM_TOKEN", "GH_TOKEN",
+    "GITHUB_TOKEN", "HF_TOKEN", "NETRC",
+})
+# Variables that must be PRESERVED by the sanitizer are not credentials, so the
+# filter lets them through naturally (PATH, HOME, LANG, TERM match no prefix,
+# suffix or exact secret name). HOME is only kept here to be pinned to the copy
+# by _make_env right after.
+
+
+def _sanitize_env(env: dict) -> dict:
+    """Local filter that drops secret-looking environment variables.
+
+    Replicates the intent of the Hermes core's private subprocess sanitizer
+    WITHOUT importing it (rule 9: no private core imports on public surfaces).
+    A variable is removed if its name (case-insensitive) starts with a
+    sensitive prefix, ends with a sensitive suffix, or is an exact sensitive
+    name. The plugin's own deny-list (_STRIP_ENV_KEYS / _STRIP_ENV_PREFIXES)
+    is applied by the caller as an extra layer.
+    """
+    exact_lower = {k.lower() for k in _STRIP_ENV_EXACT}
+    return {
+        k: v for k, v in env.items()
+        if k.lower() not in exact_lower
+        and not any(k.upper().startswith(p) for p in _STRIP_ENV_PREFIX)
+        and not any(k.upper().endswith(s) for s in _STRIP_ENV_SUFFIX)
+    }
+
 # Privilege-escalation tokens. They are concatenated on purpose: the plugin
 # security scanner mistakes the literal for a REAL use of sudo; here we only
 # BLOCK it.
@@ -130,7 +173,17 @@ class PreflightEnvironment:
     # --- security guards (best-effort, NOT a kernel sandbox) ---
     @staticmethod
     def _reject_sudo(command: str) -> str | None:
-        if _SUDO_RE.search(command):
+        # Audit on a NORMALIZED form: strip single/double quotes (turned into
+        # spaces) and backslash escapes, because a quote char or a backslash is
+        # NOT in _SUDO_RE's separator class and would let e.g.
+        # `bash -c 'sudo whoami'` dodge the guard. The real command is never
+        # touched — this only feeds the best-effort pattern match.
+        cmd_norm = (
+            command.replace("'", " ")
+            .replace('"', " ")
+            .replace("\\", "")
+        )
+        if _SUDO_RE.search(cmd_norm):
             return "Blocked by preflight: privilege-elevated commands are not allowed in the sandbox."
         return None
 
@@ -225,15 +278,10 @@ class PreflightEnvironment:
             if k not in _STRIP_ENV_KEYS
             and not any(k.startswith(p) for p in _STRIP_ENV_PREFIXES)
         }
-        # Reuse the Hermes local backend sanitization as the base layer (it drops
-        # Hermes-managed secrets such as FAL_*/NOUS_API_KEY that are not in our
-        # list) and keep our own deny-list as an extra layer on top. Failure to
-        # import just means our own filtering stays in charge.
-        try:
-            from tools.environments.local import _sanitize_subprocess_env as _sanitize
-            env = _sanitize(env)
-        except Exception:
-            pass
+        # Local sanitizer (prefix/suffix/exact, case-insensitive) as the base
+        # layer: drops Hermes-managed secrets such as FAL_*/NOUS_API_KEY that
+        # are not in our deny-list. No private core import (rule 9).
+        env = _sanitize_env(env)
         # HOME ALWAYS points inside the copy: `cd ~`, `~/.bashrc`, git config, etc.
         # never escape to the real user directory, even if the real HOME leaks in.
         env["HOME"] = str(self.sandbox_path)

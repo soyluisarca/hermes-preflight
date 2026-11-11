@@ -108,6 +108,9 @@ paths) or `discard`.
   never escape to the real user directory.
 - `skip_container_guards = False`: the model still goes through Hermes' approval
   guards.
+- Pattern matching can reject benign commands that merely contain the word
+  `sudo` (e.g. `echo 'no sudo here'`); this is a deliberate fail-safe, not a
+  bug.
 
 > These guards are **heuristics, not a kernel sandbox**. The command *does have
 > network access* and runs as a host process. See "What it doesn't do" below.

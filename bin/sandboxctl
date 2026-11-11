@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# sandboxctl — control de sesiones sandbox-first.
-# Uso: sandboxctl <status|diff|apply|discard> [task_id]
+# sandboxctl — control de sesiones preflight.
+# Uso: sandboxctl <status|diff|apply|discard> [task_id] [--yes]
 #
-# apply    : rsync copia -> workspace real (SOLO los archivos del diff). Acción EXPLÍCITA.
+# apply    : aplica SOLO los archivos que cambió el sandbox (diff exacto) y hace
+#            los borrados EXPLÍCITOS, nunca con --delete global. Antes verifica
+#            (fingerprint) que el workspace real NO cambió desde el clon (TOCTOU).
 # discard  : borra la copia. El workspace real no se toca.
 # status   : lista sesiones existentes y su PENDING.diff.
 # diff     : imprime el PENDING.diff de una sesión.
 set -euo pipefail
 
-: "${SANDBOX_FIRST_ROOT:=${HOME}/.hermes/sandbox}"
+# PREFLIGHT_ROOT es la variable canónica; SANDBOX_FIRST_ROOT se conserva como
+# fallback para no romper sesiones/configs/tests antiguos.
+: "${PREFLIGHT_ROOT:=${SANDBOX_FIRST_ROOT:-${HOME}/.hermes/sandbox}}"
 
 cmd="${1:-status}"
 task_id="${2:-}"
@@ -16,12 +20,12 @@ assume_yes=0
 for a in "$@"; do [[ "$a" == "--yes" || "$a" == "-y" ]] && assume_yes=1; done
 
 if [[ "$cmd" == "status" ]]; then
-  echo "=== sandbox-first: sesiones ==="
-  if [[ ! -d "$SANDBOX_FIRST_ROOT" ]]; then
-    echo "  (no hay sesiones en $SANDBOX_FIRST_ROOT)"
+  echo "=== preflight: sesiones ==="
+  if [[ ! -d "$PREFLIGHT_ROOT" ]]; then
+    echo "  (no hay sesiones en $PREFLIGHT_ROOT)"
     exit 0
   fi
-  for ws in "$SANDBOX_FIRST_ROOT"/*/workspace; do
+  for ws in "$PREFLIGHT_ROOT"/*/workspace; do
     [[ -d "$ws" ]] || continue
     id="$(basename "$(dirname "$ws")")"
     pending=0
@@ -35,19 +39,63 @@ if [[ "$cmd" == "status" ]]; then
 fi
 
 [[ -n "$task_id" ]] || { echo "uso: sandboxctl $cmd <task_id>"; exit 2; }
-WS="$SANDBOX_FIRST_ROOT/$task_id/workspace"
+WS="$PREFLIGHT_ROOT/$task_id/workspace"
 [[ -d "$WS" ]] || { echo "sesión no encontrada: $task_id"; exit 1; }
 
-ORIGIN_FILE="$SANDBOX_FIRST_ROOT/$task_id/original"
+ORIGIN_FILE="$PREFLIGHT_ROOT/$task_id/original"
 [[ -f "$ORIGIN_FILE" ]] || { echo "falta el registro del workspace original de $task_id"; exit 1; }
 ORIG="$(cat "$ORIGIN_FILE")"
 [[ -d "$ORIG" ]] || { echo "workspace original inválido: $ORIG"; exit 1; }
+
+# Fingerprint del workspace real en el momento del clon (TOCTOU guard).
+FP="$PREFLIGHT_ROOT/$task_id/original.fingerprint"
 
 case "$cmd" in
   diff)
     [[ -f "$WS/PENDING.diff" ]] && cat "$WS/PENDING.diff" || echo "(sin PENDING.diff)"
     ;;
+
   apply)
+    # 0) TOCTOU: el workspace real no debe haber cambiado desde el clon.
+    #    Sin fingerprint no podemos garantizarlo -> no aplicar.
+    if [[ ! -f "$FP" ]]; then
+      echo "✖ Sesión creada sin fingerprint de integridad; no puedo garantizar que el workspace real no cambió." >&2
+      echo "  Descártala y recréala para aplicar con seguridad:" >&2
+      echo "    sandboxctl discard $task_id" >&2
+      exit 1
+    fi
+    current_fp="$(python3 - "$ORIG" <<'PYEOF'
+import os, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+lines = []
+for _root, dirs, files in os.walk(root):
+    dirs.sort(); files.sort()
+    rel_root = os.path.relpath(_root, root)
+    for d in dirs:
+        p = os.path.join(_root, d)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        lines.append(f"{os.path.join(rel_root, d)}\t{st.st_mtime_ns}\t{st.st_size}\td")
+    for f in files:
+        p = os.path.join(_root, f)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        lines.append(f"{os.path.join(rel_root, f)}\t{st.st_mtime_ns}\t{st.st_size}\tf")
+print("\n".join(sorted(lines)))
+PYEOF
+)"
+    if [[ "$current_fp" != "$(cat "$FP")" ]]; then
+      echo "✖ El workspace real CAMBIÓ desde que se clonó la copia. Re-sincroniza:" >&2
+      echo "    sandboxctl discard $task_id" >&2
+      echo "  y deja al agente crear una sesión nueva. Si aplicas ahora pisarías el cambio real." >&2
+      exit 1
+    fi
+
     echo "▶ Aplicando cambios de '$task_id' al workspace real..."
     echo "  origen : $WS"
     echo "  destino: $ORIG"
@@ -62,19 +110,40 @@ case "$cmd" in
     else
       read -r -p "¿Aplicar? esto SOBREESCRIBE el workspace real [s/N]: " ans
     fi
+
     if [[ "$ans" =~ ^[sSyY]$ ]]; then
-      # --delete: los borrados del diff también se aplican. -a preserva metadatos.
-      rsync -a --delete --exclude=PENDING.diff "$WS/" "$ORIG/"
+      # 1) contenido nuevo/modificado: rsync SIN --delete. Ningún archivo del
+      #    workspace real se borra aquí (un archivo creado en el real tras el
+      #    clon sobrevive; el fingerprint de arriba ya garantiza que no pasó).
+      rsync -a --exclude=PENDING.diff "$WS/" "$ORIG/"
+      # 2) borrados EXPLÍCITOS: solo los paths que el sandbox eliminó (presentes
+      #    en ORIG, ausentes en WS). Nunca --delete global. Con el fingerprint OK
+      #    no hay archivos creados por el usuario tras el clon, así que el
+      #    conjunto es exacto; el `! -e "$WS/$d"` es una red extra.
+      while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        target="$ORIG/$d"
+        if [[ ! -e "$WS/$d" ]]; then
+          if [[ -d "$target" && ! -L "$target" ]]; then
+            rm -rf -- "$target"
+          else
+            rm -f -- "$target"
+          fi
+        fi
+      done < <(rsync -av --delete --dry-run --exclude=PENDING.diff "$WS/" "$ORIG/" 2>/dev/null \
+                | grep '^deleting ' | sed 's/^deleting //' || true)
       echo "✔ Aplicado."
     else
       echo "✖ Aplicación cancelada."
       exit 1
     fi
     ;;
+
   discard)
-    rm -rf -- "$SANDBOX_FIRST_ROOT/$task_id"
+    rm -rf -- "$PREFLIGHT_ROOT/$task_id"
     echo "✔ Sesión '$task_id' descartada (el workspace real no se tocó)."
     ;;
+
   *)
     echo "comando desconocido: $cmd (status|diff|apply|discard)"
     exit 2

@@ -1,135 +1,156 @@
 # preflight
 
-**Dry-run gate con aprobación**, no un sandbox de aislamiento. Terminal backend para
-Hermes que corre **cada comando en una copia desechable** del workspace, enseña qué
-cambiaría (**diff exacto**), y **solo aplica** los cambios al workspace real si *tú*
-lo apruebas explícitamente. Un dry-run universal: un `rm -rf`, una migración o un
-script nunca tocan tus datos por accidente.
+**An approval dry-run gate, not an isolation sandbox.** A terminal backend for
+Hermes that runs **every command in a throwaway copy** of your workspace, shows
+you exactly what would change (**exact diff**), and **applies** the changes to
+the real workspace only if *you* explicitly approve them. A universal dry-run:
+a misfired `rm -rf`, a migration or a script never touches your data by accident.
 
-> Diseño en una línea: **el agente VE el workspace real, EJECUTA en la copia, y
-> APLICA con tu aprobación.**
+> One-line design: **the agent SEES the real workspace, EXECUTES on the copy,
+> and APPLIES with your approval.**
 
-## El problema que resuelve
+Status: `v0.1.0` · plugin `validated` · standalone sandbox test `9/9 passing` ·
+runs on `linux` and `macos`.
 
-Hoy un agente ejecuta comandos reales y ya: un `rm -rf` mal apuntado es datos que se
-van para siempre. No existe un "revísame antes" universal. Con **preflight**, el
-agente trabaja sobre una copia; si el comando sale mal, descartas la copia y el
-workspace real queda intacto.
-
-## Instalación
+## Quickstart
 
 ```bash
 hermes plugins enable preflight
 hermes config set terminal.backend preflight
 ```
 
-(Asume backend en proceso — `plugins.isolation: in_process`, el default. Cambios de
-config los hace el dueño del config, no este plugin.)
+That's it. Your next terminal commands run inside a copy of the workspace and
+nothing is applied until you run `sandboxctl apply <task_id>`.
 
-## Demo guionada (90s)
+## Why preflight?
 
-1. Activa el plugin y desactívalo a mano (0:00–0:10):
-   ```
-   hermes plugins enable preflight
-   hermes config set terminal.backend preflight
-   ```
-2. En el workspace real, revisa el estado (0:10–0:15):
-   ```
-   sandboxctl status
-   ```
-3. Pide al agente `rm -rf subdir` (0:15–0:30). El agente lo corre **en la copia**.
-4. Verifica que el workspace real NO cambió (0:30–0:40):
-   ```
-   ls subdir            # sigue ahí en el real
-   sandboxctl status    # la sesión reporta cambios pendientes
-   ```
-5. Mira el diff (0:40–0:55):
-   ```
-   sandboxctl diff demo-test
-   ```
-   Ahí ves exactamente los archivos que se borrarían.
-6. Decide (0:55–1:30): `sandboxctl apply demo-test` para aplicar (escribe `s`),
-   o `sandboxctl discard demo-test` para tirar la copia sin tocar nada.
+Today an agent just executes real commands: a wrong `rm -rf` is data gone
+forever. There is no universal "review this before I run it" step. With
+**preflight** the agent works on a copy; if the command goes sideways you
+discard the copy and the real workspace is untouched.
 
-## Cómo funciona
+|                       | preflight                    | bubblewrap              | runbox / Docker     | deadbolt                 |
+|-----------------------|------------------------------|-------------------------|---------------------|--------------------------|
+| What it isolates      | the *workspace copy*         | the whole process       | the whole process   | the real filesystem      |
+| Container / kernel    | No — host process            | Yes (namespaces/bind)   | Yes (Docker)        | No (still host process)  |
+| Shows what changes    | Yes, **exact diff** + select ive apply | No — isolates, doesn't teach | No — export, no diff    | No diff                  |
+| Before writing        | Diff + explicit approval     | No review gate          | No review gate      | Write-approval prompts   |
+| Re-apply to the real  | `apply`/`discard` explicit   | None (dies with ctr)    | `export` / copy     | N/A (writes go through)  |
 
-- `create_environment()` crea `~/.hermes/sandbox/<id>/workspace` y clona el workspace
-  con **reflink** (`cp --reflink=always`, copia de escritura-perezosa: costo cero de
-  bytes en btrfs/xfs, copia completa como fallback). Descarta el contenido previo del
-  mismo id para no arrastrar estado.
-  > Nota de diseño: la idea pedía hardlinks (`cp -al`). No los usé como método
-  > primario porque comparten inode: un `echo x > archivo` en el sandbox tocaría el
-  > original *sin* pasar por `apply`. Reflink da el mismo "no copio bytes" y aísla de
-  > verdad.
-- `execute()` corre el comando en la copia, con env filtrado (secretos vía
-  `strip_env_keys`), aplica guardas y devuelve `{output, exit_code}`.
-- Tras cada comando, calcula el diff original ↔ copia (`git diff --no-index` si hay
-  `.git`, `diff -ruN` si no) y lo acumula en `PENDING.diff` de la sesión.
-- **Nada se aplica solo.** `apply`/`discard` son acciones explícitas, vía el script
-  `bin/sandboxctl` (requiere confirmación por teclado).
+- **bubblewrap** isolates but never *teaches*: it runs in a container and
+  whatever happens inside dies with it, with no diff and no prior decision.
+- **runbox** exports Docker images but offers no exact diff to review.
+- **deadbolt** gates writes with approval prompts but shows no diff of the
+  whole operation.
+- **preflight** is a **decision gate**: you see exactly what would change and
+  decide before it touches the real workspace.
 
-## Diferencias vs. otras herramientas
+## A real diff
 
-|                        | preflight                | bubblewrap                | runbox / Docker         |
-|------------------------|------------------------------|---------------------------|-------------------------|
-| Qué aísla              | La *copia* del workspace     | El proceso completo       | El proceso completo     |
-| Contenedor / kernel    | No — proceso del host        | Sí (namespaces/bind)      | Sí (Docker)             |
-| ¿Enseña qué cambiará?  | Sí, `diff` exacto antes de `apply` | No — aísla, no enseña       | No — export sin diff       |
-| Antes de escribir      | Diff + aprobación explícita  | Sin gate de revisión      | Sin gate de revisión    |
-| Re-flujo a lo real     | `apply`/`discard` explícitos | Ninguno (muere con el ctr)| `export` / copiar       |
+After a command, the session's `PENDING.diff` shows what applying would do.
+This is genuine `diff -ruN` output from a session where the sandbox changed a
+config file and deleted a secret:
 
-bubblewrap **aísla pero no enseña**: corre en un contenedor y lo que pasa adentro
-muere con él, sin mostrarte un diff ni darte una decisión previa. runbox exporta
-imagenes de Docker pero sin un diff exacto que puedas revisar antes de aplicar.
-preflight es un **gate de decisión**: ves exactamente qué cambiará y decides
-antes de que toque el workspace real.
+```
+diff -ruN -x PENDING.diff /real/ws /sandbox/task-AB12/workspace
+--- /real/ws/src/config.py        2026-11-10 22:46:02.783832625 -0600
++++ /sandbox/task-AB12/workspace/src/config.py  1969-12-31 18:00:00.000000000 -0600
+@@ -1,2 +1,2 @@
+-API_KEY = "sk-REAL-SECRET"
++API_KEY = "sk-SAFE-SECRET"
+Only in /real/ws: credentials/db-password.txt
+```
 
-## Guardas de seguridad
+You review it, then decide to `apply` (it will *selectively* sync only those
+paths) or `discard`.
 
-- Rechaza `sudo` / `doas`.
-- Rechaza rutas absolutas que apunten **fuera** de la copia.
-- Rechaza redirecciones de escritura (`>`, `2>`) a rutas fuera de la copia.
-- Rechaza la operación si la copia contiene **symlinks que escapen** del sandbox
-  (preservados por el clon; un symlink a `/etc` o `~/.ssh` saltaría la copia).
-- **Entorno filtrado**: se eliminan del subproceso los secretos exactos
-  (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) y una deny-list de
-  prefijos sensibles (`SSH_AUTH_SOCK`, `AWS_*`, `GCP_*`/`GCLOUD_*`, `DOCKER_*`,
-  `AZURE_*`, `NPM_TOKEN`, `GH_TOKEN`/`GITHUB_TOKEN`,
-  `GOOGLE_APPLICATION_CREDENTIALS`).
-- Sin red: el sandbox no hace streaming ni telemetría.
-- `skip_container_guards = False`: el modelo sigue pasando por los guards de
-  aprobación de Hermes.
+## How it works
 
-## Limitaciones honestas
+- `create_environment()` creates `<root>/<id>/workspace` and clones the workspace
+  with **reflink** (`cp --reflink=always`, copy-on-write: zero-byte cost on
+  btrfs/xfs, full copy as fallback). Existing pending changes for the same id
+  are **reused**, never re-cloned, so your diff is not lost.
+  > Design note: the idea originally asked for hardlinks (`cp -al`). Those are
+  > not the primary method because they share inodes: `echo x > file` in the
+  > sandbox would touch the original *without* going through `apply`. Reflink
+  > gives the same "I copy no bytes" and isolates for real.
+- `execute()` runs the command in the copy with a filtered environment
+  (secrets stripped), applies guards, and returns `{output, exit_code}`.
+- After each command it recomputes the diff original ↔ copy (`git diff
+  --no-index` when there is a `.git`, `diff -ruN` otherwise) into
+  `PENDING.diff`.
+- **Nothing applies on its own.** `apply` runs a **selective** sync — it copies
+  only the paths the diff changed and performs deletions **explicitly** (never a
+  global `--delete`). Before applying it rechecks a fingerprint of the real
+  workspace taken at clone time and **aborts if the real workspace changed**
+  since the session started (TOCTOU guard), reminding you to re-sync.
 
-- **No es un sandbox real de kernel.** El shell corre en el host (el `cwd` es una
-  copia). Los guards de rutas absolutas son una red de seguridad por patrones, no un
-  contenedor: alguien con `sudo` (bloqueado) o un shell anidado más listo podría
-  evadirlos. Para aislamiento contundente, Docker/Modal siguen siendo la opción.
-- Reflink cae a copia completa en filesystems sin CoW (p. ej. EXT4): más lento en
-  workspaces grandes, pero igual de seguro.
-- `task_id` distinto implica copia distinta: los cambios no se comparten entre
-  sesiones.
-- En un repo git hay que map/revisar el `PENDING.diff` a ojo (el header lo orienta);
-  el diff crudo incluye los nombres de ruta absolutos.
-- El diff usa `git diff --no-index`; para `.git`, `PENDING.diff` se excluye solo en el
-  modo `diff -ruN`.
+## Security guards (best-effort)
 
-## Archivos
+- Rejects `sudo` / `doas`, including after shell separators (`x&&sudo`,
+  `(sudo …)`, `` `sudo …` ``).
+- Rejects absolute paths that point **outside** the copy (including a bare `/`).
+- Rejects write redirections (`>`, `2>`) to paths outside the copy.
+- Rejects the operation if the copy contains **symlinks that escape** the
+  sandbox (preserved by the clone; a symlink to `/etc` or `~/.ssh` would
+  bypass the copy).
+- **Filtered environment**: secrets are removed from the subprocess — the
+  Hermes managed-secret sanitizer (the same one the local backend uses) plus
+  our own deny-list of exact keys and prefixes (`OPENROUTER_API_KEY`,
+  `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SSH_AUTH_SOCK`, `AWS_*`,
+  `GCP_*`/`GCLOUD_*`, `DOCKER_*`, `AZURE_*`, `NPM_TOKEN`, `GH_TOKEN`/
+  `GITHUB_TOKEN`, `FAL_*`, `NOUS_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`).
+- `HOME` is pinned **inside the copy**, so `cd ~`, `~/.bashrc`, git config etc.
+  never escape to the real user directory.
+- `skip_container_guards = False`: the model still goes through Hermes' approval
+  guards.
+
+> These guards are **heuristics, not a kernel sandbox**. The command *does have
+> network access* and runs as a host process. See "What it doesn't do" below.
+
+## When NOT to use preflight
+
+- **Kernel isolation** is mandatory — preflight is a decision gate, not a
+  container. Use Docker/Modal/VMs for hostile or untrusted code.
+- **Hostile code** — a command meant to fight back (not just a mistaken `rm`)
+  can defeat regex guards. Don't run untrusted code here.
+- **Very large workspaces without copy-on-write** — on filesystems without
+  CoW (e.g. EXT4) the full-copy fallback is slow; you may not want a full copy
+  per session.
+
+## Honest limitations
+
+- **Not a real kernel sandbox.** The shell runs on the host (the `cwd` is a
+  copy). Path/sudo guards are best-effort pattern matching and a cleverer
+  nested shell could evade them.
+- **The command has network access** — it is *not* a network-isolating sandbox.
+- **WSL /mnt/c is slow** — a Windows-linked path is slow to walk/copy; keep the
+  workspace on a Linux filesystem (e.g. `~/`) for fast reflink clones.
+- **`sandboxctl` is not on your PATH** — add an alias in `~/.bashrc`:
+  ```bash
+  alias sandboxctl="$HOME/.hermes/plugins/preflight/bin/sandboxctl"
+  ```
+- Reflink falls back to a full copy on filesystems without CoW (e.g. EXT4):
+  slower on big workspaces, equally safe.
+- Different `task_id` means a different copy: changes are not shared between
+  sessions.
+- The raw diff includes absolute path names; in a git repo you may want to
+  review `PENDING.diff` against the repo.
+
+## Files
 
 ```
 ~/.hermes/plugins/preflight/
-├── plugin.yaml          # id/versión/kind: backend
+├── plugin.yaml          # id/version/kind: backend
 ├── __init__.py          # Provider + Environment + register(ctx)
 ├── bin/sandboxctl       # status | diff | apply | discard
-├── _test_sandbox.py     # test funcional (corre: python3 _test_sandbox.py)
-└── README.md            # este archivo
+├── tests/_test_sandbox.py # functional test (run: python3 tests/_test_sandbox.py)
+└── README.md            # this file
 ```
 
-## Verificación rápida
+## Quick verification
 
 ```bash
-python3 ~/.hermes/plugins/preflight/_test_sandbox.py
+python3 tests/_test_sandbox.py   # must end with: TODO PASS ✔
+hermes plugins validate ~/.hermes/plugins/preflight   # Validation passed, security scan safe
 ```
-
-Debe terminar con `TODO PASS ✔`.

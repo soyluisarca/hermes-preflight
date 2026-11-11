@@ -15,12 +15,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path("/home/lac71/.hermes/hermes-agent")
-PLUGIN_DIR = Path("/home/lac71/.hermes/plugins/preflight")
+# Paths relativos al propio test; el repo de Hermes se toma de HERMES_AGENT_REPO
+# (o de un default razonable) para que el test corra en cualquier máquina.
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+REPO = Path(os.environ.get("HERMES_AGENT_REPO", str(Path.home() / ".hermes" / "hermes-agent")))
 sys.path.insert(0, str(REPO))
 
 # Sandbox temporal aislado (no tocamos ~/.hermes/sandbox del usuario).
-os.environ["SANDBOX_FIRST_ROOT"] = tempfile.mkdtemp(prefix="sbx-test-")
+os.environ["PREFLIGHT_ROOT"] = tempfile.mkdtemp(prefix="sbx-test-")
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="sbx-home-")
 
 mod = {}
@@ -95,7 +97,7 @@ print("PASS 6: apply aplicó exactamente lo del diff (borró a.txt/b.txt, conser
 # recreamos un borrado en una sesión nueva para probar discard limpio
 env2 = provider.create_environment(cwd=str(ws), timeout=15, task_id="discard-test")
 env2.execute("rm -f root.txt")
-(sb_root := Path(os.environ["SANDBOX_FIRST_ROOT"]))
+(sb_root := Path(os.environ["PREFLIGHT_ROOT"]))
 subprocess.run(["bash", str(sbctl), "discard", "discard-test", "--yes"], capture_output=True, text=True, env={**os.environ})
 assert (ws / "root.txt").exists(), "discard tocó el workspace real"
 assert not (sb_root / "discard-test").exists(), "discard no borró la sesión"
@@ -103,7 +105,7 @@ print("PASS 7: discard no tocó el workspace real y limpió la sesión")
 
 # --- 8) guardas: sudo bloqueado; ruta absoluta fuera bloqueada ---
 r_sudo = env.execute("sudo rm -rf /")
-assert r_sudo["exit_code"] == 1 and ("privilegios elevados" in r_sudo["output"].lower() or "bloqueado" in r_sudo["output"].lower())
+assert r_sudo["exit_code"] == 1 and ("privilege-elevated" in r_sudo["output"].lower() or "blocked" in r_sudo["output"].lower() or "privilegios elevados" in r_sudo["output"].lower() or "bloqueado" in r_sudo["output"].lower())
 print("PASS 8: sudo bloqueado")
 
 # --- 9) symlink que escapa de la copia -> operación bloqueada ---

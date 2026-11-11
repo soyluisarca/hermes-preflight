@@ -1,4 +1,5 @@
 name: preflight
 version: 0.1.0
-description: "Dry-run gate con aprobación: corre cada comando en una copia desechable del workspace (reflink/copia, aislada), muestra el diff exacto y solo aplica lo que apruebas."
+description: "Preflight dry-run gate: runs each command in a throwaway workspace copy (isolated), shows the exact diff, and applies only what you explicitly approve."
+requires_hermes: ">=0.22.0"
 kind: backend

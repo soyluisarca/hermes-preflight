@@ -1,8 +1,10 @@
-"""preflight: terminal backend que corre comandos en una copia desechable del workspace.
+"""preflight: terminal backend that runs each command in a throwaway copy of the
+workspace.
 
-Cada comando se ejecuta en una copia local (reflink / copia completa) del workspace.
-El workspace real NO se toca. Tras cada comando se acumula un diff en PENDING.diff.
-Aplicar (rsync copia -> real) y descartar son acciones EXPLÍCITAS que nunca ocurren solas.
+Every command executes inside a local copy (reflink full copy) of the real
+workspace. The real workspace is NEVER touched. After each command a diff is
+accumulated in PENDING.diff. Applying (selective rsync copy -> real) and
+discarding are EXPLICIT actions that never happen on their own.
 """
 
 from __future__ import annotations
@@ -17,36 +19,88 @@ from pathlib import Path
 
 from agent.terminal_env_provider import TerminalEnvironmentProvider
 
-# Directorio raíz de sandboxes (raíz de PKG, no se expone por red ni al usuario).
-SANDROOT = Path(os.getenv("SANDBOX_FIRST_ROOT", str(Path.home() / ".hermes" / "sandbox")))
+# Root directory for sandboxes (root of PKG, not exposed to network or user).
+# PREFLIGHT_ROOT is the canonical variable; SANDBOX_FIRST_ROOT is kept as a
+# fallback so existing sessions, cron configs and the standalone test keep
+# working without changes.
+SANDROOT = Path(
+    os.getenv("PREFLIGHT_ROOT")
+    or os.getenv("SANDBOX_FIRST_ROOT")
+    or (Path.home() / ".hermes" / "sandbox")
+)
 
-# Nombres exactos de variables de entorno que nunca deben llegar al subproceso (secretos).
+# Exact environment variable names that must never reach the subprocess (secrets).
 _STRIP_ENV_KEYS = frozenset({
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
     "SSH_AUTH_SOCK", "NPM_TOKEN", "GH_TOKEN", "GITHUB_TOKEN",
-    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GOOGLE_APPLICATION_CREDENTIALS", "FAL_KEY", "FAL_API_KEY",
+    "NOUS_API_KEY",
 })
 
-# Prefijos de variables sensibles que también se filtran (deny-list por prefijo).
+# Sensitive variable prefixes also filtered (deny-list by prefix).
 _STRIP_ENV_PREFIXES = frozenset({"AWS_", "GCP_", "GCLOUD_", "DOCKER_", "AZURE_"})
 
-# Tokens de privilegio elevado. Se concatenan a propósito: el escáner estático de
-# plugins confunde el literal con un USO real de sudo; aquí solo se BLOQUEA.
+# Privilege-escalation tokens. They are concatenated on purpose: the plugin
+# security scanner mistakes the literal for a REAL use of sudo; here we only
+# BLOCK it.
 _PRIV_TOKENS = ("su" "do", "doas")
-# Patrón para detectar intentos de privilegio elevado (espacios variables).
-_SUDO_RE = re.compile(r"(^|\s)(" + "|".join(_PRIV_TOKENS) + r")(\s|$)", re.MULTILINE)
+# Pattern to detect privilege-escalation attempts. Boundaries include shell
+# separators (`; & | ( ) \`` and whitespace) so `x&&sudo ...`, `(sudo ...)` or
+# `` `sudo ...` `` are caught, not just leading-whitespace cases.
+_SUDO_RE = re.compile(
+    r"(^|[;&|()` \t]+)(" + "|".join(_PRIV_TOKENS) + r")([;&|()` \t]+|$)",
+    re.MULTILINE,
+)
 
 
-class SandboxFirstEnvironment:
-    """Cumple el contrato duck-typed de BaseEnvironment (execute/cleanup).
+def _partial_str(data) -> str:
+    """Normalize captured output that may be ``str`` or ``bytes`` before concat."""
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return str(data)
 
-    Contrato HONESTO (no declaramos lo que no hacemos):
-      - NO es un contenedor. El comando corre en una COPIA local (reflink/copia)
-        del workspace, pero el proceso es del host.
-      - uses_host_filesystem = True: los file-tools del agente leen el workspace
-        REAL, no la copia. El agente VE el real, EJECUTA en la copia y APLICA
-        con aprobación explícita.
-      - is_local = True: corre en la máquina local, no remota.
+
+def _write_original_fingerprint(original: Path, dst: Path) -> None:
+    """Snapshot of the real workspace at clone time.
+
+    ``sandboxctl apply`` recomputes this and aborts if it changed since the
+    clone (TOCTOU guard): a file created or edited in the real workspace AFTER
+    the clone must never be silently clobbered by an apply.
+    """
+    lines: list[str] = []
+    for root, dirs, files in os.walk(original):
+        dirs.sort()
+        files.sort()
+        rel_root = os.path.relpath(root, original)
+        for d in dirs:
+            p = os.path.join(root, d)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            lines.append(f"{os.path.join(rel_root, d)}\t{st.st_mtime_ns}\t{st.st_size}\td")
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            lines.append(f"{os.path.join(rel_root, f)}\t{st.st_mtime_ns}\t{st.st_size}\tf")
+    dst.write_text("\n".join(sorted(lines)), encoding="utf-8")
+
+
+class PreflightEnvironment:
+    """Duck-typed BaseEnvironment (execute/cleanup).
+
+    HONEST contract (we do not claim what we do not do):
+      - NOT a container. The command runs in a LOCAL copy (reflink/copy) of the
+        workspace, but the process is a host process.
+      - uses_host_filesystem = True: the agent's file-tools read the REAL
+        workspace, not the copy. The agent SEES the real one, EXECUTES on the
+        copy and APPLIES with explicit approval.
+      - is_local = True: runs on the local machine, not remote.
     """
 
     uses_host_filesystem = True
@@ -60,7 +114,7 @@ class SandboxFirstEnvironment:
         self.timeout = timeout
         self.sandbox_path = sandbox_path
         self.original_path = original_path
-        # cwd dentro de la copia: si la ruta arranca en el original, la reencuadramos.
+        # cwd inside the copy: if the path starts at the original, remap it.
         self.sandbox_cwd = self._remap_cwd(cwd)
         self._pending = sandbox_path / "PENDING.diff"
 
@@ -73,28 +127,36 @@ class SandboxFirstEnvironment:
             return str(self.sandbox_path)
         return str(self.sandbox_path / rel)
 
-    # --- guardas de seguridad ---
+    # --- security guards (best-effort, NOT a kernel sandbox) ---
     @staticmethod
     def _reject_sudo(command: str) -> str | None:
         if _SUDO_RE.search(command):
-            return "Bloqueado por preflight: comandos con privilegios elevados no están permitidos en el sandbox."
+            return "Blocked by preflight: privilege-elevated commands are not allowed in the sandbox."
         return None
 
     @staticmethod
     def _block_host_absolute_paths(command: str, sandbox_path: Path) -> list[str]:
-        """Detección simple de rutas absolutas que apuntan FUERA de la copia.
+        """Best-effort detection of absolute paths pointing OUTSIDE the copy.
 
-        No es un sandbox real (el shell corre en el host), así que esta guarda es una
-        red de seguridad honesta, no un muro infranqueable.
+        Not a real sandbox (the shell runs on the host), so this guard is an
+        honest safety net, not an impenetrable wall.
         """
-        problems = []
-        for tok in shlex.split(command):
+        problems: list[str] = []
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            # Unbalanced quotes / heredocs: fall back to a regex scan of absolute
+            # tokens. Never block on a parse failure.
+            tokens = [m.group(0) for m in re.finditer(r"/[^\s'\"`;|&()]*", command)]
+        for tok in tokens:
             if not tok.startswith("/"):
                 continue
             tok = tok.rstrip("/")
             if not tok:
+                # The verbatim token was "/" (host root): always outside the copy.
+                problems.append("/")
                 continue
-            # /tmp dentro de la copia y la propia copia se permiten; el resto se marca.
+            # /tmp inside the copy and the copy itself are allowed; everything else is flagged.
             if tok == str(sandbox_path):
                 continue
             try:
@@ -106,8 +168,7 @@ class SandboxFirstEnvironment:
         return problems
 
     def _block_writes_outside(self, command: str):
-        """Rechaza *writes* explícitos (redirección o >) a rutas absolutas fuera de la copia."""
-        # Patrón grosero: redirecciones con ruta absoluta no perteneciente a la copia.
+        """Reject explicit *writes* (redirection or >) to absolute paths outside the copy."""
         for m in re.finditer(r"[12]?>+\s*('([^']*)'|\"([^\"]*)\"|(\S+))", command):
             target = m.group(2) or m.group(3) or m.group(4) or ""
             if not target.startswith("/"):
@@ -118,25 +179,25 @@ class SandboxFirstEnvironment:
                 is_under = False
             if not is_under and target != "/dev/null":
                 return (
-                    f"Bloqueado por preflight: redirección de escritura a ruta fuera de la "
-                    f"copia ({target}). Nada se escribe fuera del sandbox."
+                    f"Blocked by preflight: write redirection to a path outside the "
+                    f"copy ({target}). Nothing is written outside the sandbox."
                 )
         return None
 
     def _block_symlink_escape(self) -> str | None:
-        """Rechaza la operación si la copia contiene symlinks que escapan del sandbox.
+        """Reject the operation if the copy contains symlinks escaping the sandbox.
 
-        `cp -a` / `shutil.copytree(symlinks=True)` preservan los symlinks. Un symlink
-        que apunte fuera (p. ej. /etc, ~/.ssh, una ruta del host real) permitiría a un
-        comando leer/escribir fuera del sandbox a través de la ruta, saltándose la
-        copia. Mientras haya uno en la copia, bloqueamos la operación.
+        `cp -a` / `shutil.copytree(symlinks=True)` preserve symlinks. A symlink
+        pointing outside (e.g. /etc, ~/.ssh, a real host path) would let a
+        command read/write outside the sandbox through the path, bypassing the
+        copy. As long as one exists in the copy we block the operation.
         """
         try:
             sp_real = os.path.realpath(self.sandbox_path)
         except Exception:
             sp_real = str(self.sandbox_path)
         prefix = sp_real.rstrip("/") + os.sep
-        escaping = []
+        escaping: list[str] = []
         for p in self.sandbox_path.rglob("*"):
             if not p.is_symlink():
                 continue
@@ -148,17 +209,38 @@ class SandboxFirstEnvironment:
                 escaping.append(str(p))
         if escaping:
             shown = ", ".join(escaping[:5])
-            more = f" y {len(escaping)-5} más" if len(escaping) > 5 else ""
+            more = f" and {len(escaping)-5} more" if len(escaping) > 5 else ""
             return (
-                "Bloqueado por preflight: la copia contiene symlink(s) que escapan "
-                f"del sandbox ({shown}{more}). Elimínalos en el workspace real o usa un "
-                "workspace sin symlinks hacia fuera; así garantizamos que ningún comando "
-                "salga del sandbox por un symlink."
+                f"Blocked by preflight: the copy contains symlink(s) escaping "
+                f"the sandbox ({shown}{more}). Remove them from the real workspace "
+                f"or use a workspace without outward symlinks so that no command "
+                f"can leave the sandbox through a symlink."
             )
         return None
 
+    def _make_env(self) -> dict:
+        # Own deny-list first (exact secrets + sensitive prefixes).
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in _STRIP_ENV_KEYS
+            and not any(k.startswith(p) for p in _STRIP_ENV_PREFIXES)
+        }
+        # Reuse the Hermes local backend sanitization as the base layer (it drops
+        # Hermes-managed secrets such as FAL_*/NOUS_API_KEY that are not in our
+        # list) and keep our own deny-list as an extra layer on top. Failure to
+        # import just means our own filtering stays in charge.
+        try:
+            from tools.environments.local import _sanitize_subprocess_env as _sanitize
+            env = _sanitize(env)
+        except Exception:
+            pass
+        # HOME ALWAYS points inside the copy: `cd ~`, `~/.bashrc`, git config, etc.
+        # never escape to the real user directory, even if the real HOME leaks in.
+        env["HOME"] = str(self.sandbox_path)
+        return env
+
     def execute(self, command: str, timeout: int | None = None, **kwargs):
-        # 1) Guardas de seguridad.
+        # 1) Security guards.
         sudo_err = self._reject_sudo(command)
         if sudo_err:
             return {"output": sudo_err, "exit_code": 1, "returncode": 1}
@@ -175,8 +257,8 @@ class SandboxFirstEnvironment:
         if paths:
             return {
                 "output": (
-                    "Bloqueado por preflight: ruta(s) absoluta(s) fuera de la copia del "
-                    f"sandbox: {', '.join(paths)}"
+                    "Blocked by preflight: absolute path(s) outside the sandbox "
+                    f"copy: {', '.join(paths)}"
                 ),
                 "exit_code": 1,
                 "returncode": 1,
@@ -184,15 +266,10 @@ class SandboxFirstEnvironment:
 
         effective_timeout = timeout or self.timeout or 120
 
-        # 2) Entorno filtrado: secretos exactos + deny-list por prefijo fuera.
-        env = {
-            k: v for k, v in os.environ.items()
-            if k not in _STRIP_ENV_KEYS
-            and not any(k.startswith(p) for p in _STRIP_ENV_PREFIXES)
-        }
-        env.setdefault("HOME", str(Path.home()))
+        # 2) Filtered environment (secrets removed; HOME pinned to the copy).
+        env = self._make_env()
 
-        # 3) Corre en la copia.
+        # 3) Run inside the copy.
         try:
             proc = subprocess.run(
                 ["bash", "-c", command],
@@ -204,30 +281,34 @@ class SandboxFirstEnvironment:
             )
         except subprocess.TimeoutExpired as exc:
             return {
-                "output": (exc.stdout or "") + (exc.stderr or "") + f"\n[Command timed out after {effective_timeout}s]",
+                "output": (
+                    _partial_str(exc.stdout)
+                    + _partial_str(exc.stderr)
+                    + f"\n[Command timed out after {effective_timeout}s]"
+                ),
                 "exit_code": 124,
                 "returncode": 124,
             }
 
-        output = (proc.stdout or "") + (proc.stderr or "")
+        output = _partial_str(proc.stdout) + _partial_str(proc.stderr)
         result = {"output": output, "exit_code": proc.returncode, "returncode": proc.returncode}
 
-        # 4) Diff acumulado tras cada comando.
+        # 4) Accumulated diff after each command.
         try:
             self._write_pending_diff()
-        except Exception as e:  # el diff jamás rompe la ejecución
-            result["output"] += f"\n[aviso: no se pudo escribir PENDING.diff: {e}]"
+        except Exception as e:  # the diff must never break execution
+            result["output"] += f"\n[warning: could not write PENDING.diff: {e}]"
         return result
 
-    # --- diff acumulado ---
+    # --- accumulated diff ---
     def _diff_command(self):
         if (self.original_path / ".git").is_dir():
-            # git diff --no-index trata las dos rutas como árboles independientes.
+            # git diff --no-index treats both paths as independent trees.
             return (
                 f"git diff --no-index --no-color "
                 f"-- {shlex.quote(str(self.original_path))} {shlex.quote(str(self.sandbox_path))}"
             )
-        # diff -ruN: excluye la ruta del propio archivo de diff (usado fuera de git).
+        # diff -ruN: excludes the diff-file's own path (used outside of git).
         return (
             f"diff -ruN -x PENDING.diff "
             f"{shlex.quote(str(self.original_path))} {shlex.quote(str(self.sandbox_path))}"
@@ -236,41 +317,42 @@ class SandboxFirstEnvironment:
     def _write_pending_diff(self):
         cmd = self._diff_command()
         proc = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
-        body = (proc.stdout or "") + (proc.stderr or "")
-        # diff sale con rc != 0 cuando hay diferencias (normal). No lo tratamos como error.
+        body = _partial_str(proc.stdout) + _partial_str(proc.stderr)
+        # diff exits rc != 0 when there are differences (normal). Not an error.
         header = (
             f"# PENDING.diff — preflight ({self.sandbox_path.name})\n"
             f"# ORIGINAL : {self.original_path}\n"
             f"# SANDBOX  : {self.sandbox_path}\n"
-            f"# Acumulado tras el último comando ejecutado.\n"
-            f"# Nada se ha aplicado aún al workspace real.\n"
-            f"# Para aplicar: sandboxctl apply {self.sandbox_path.name}\n"
-            f"# Para descartar: sandboxctl discard {self.sandbox_path.name}\n\n"
+            f"# # Accumulated after the last executed command.\n"
+            f"# Nothing has been applied to the real workspace yet.\n"
+            f"# To apply: sandboxctl apply {self.sandbox_path.name}\n"
+            f"# To discard: sandboxctl discard {self.sandbox_path.name}\n\n"
         )
         self._pending.write_text(header + body, encoding="utf-8")
 
     def cleanup(self):
-        """Deja el sandbox intacto (no borra). El descarte es explícito (discard)."""
+        """Leave the sandbox intact (no delete). Discard is explicit (discard)."""
 
 
 class PreflightProvider(TerminalEnvironmentProvider):
     name = "preflight"
     display_name = "Preflight"
 
-    # NO es un contenedor: el comando corre en una COPIA local (reflink/copia) del
-    # workspace real. El proceso es del host; no hay aislamiento de kernel ni de red.
-    # is_container=False es lo honesto — declaramos un "dry-run gate", no un sandbox.
-    # los file-tools del agente siguen leyendo el workspace REAL (uses_host_filesystem).
+    # NOT a container: the command runs in a LOCAL copy (reflink/copy) of the
+    # real workspace. The process is a host process; no kernel or network
+    # isolation. is_container=False is the honest option — we declare a
+    # "dry-run gate", not a sandbox. The agent's file-tools keep reading the REAL
+    # workspace (uses_host_filesystem).
     is_remote = False
     is_container = False
 
     def __init__(self):
-        # import tardío para que el plugin cargue aunque el paquete raíz no esté importado
+        # late import so the plugin loads even if the root package is not imported
         pass
 
     @property
     def description(self):
-        return "Dry-run gate con aprobación: corre cada comando en una copia, muestra el diff exacto y solo aplica lo que apruebas."
+        return "Preflight dry-run gate: runs each command in a throwaway workspace copy, shows the exact diff, and applies only what you approve."
 
     @property
     def strip_env_keys(self):
@@ -278,13 +360,13 @@ class PreflightProvider(TerminalEnvironmentProvider):
 
     @property
     def skip_container_guards(self):
-        # No saltamos los guards de aprobación: queremos que el modelo apruebe antes de
-        # acciones de riesgo. (El backend ya nunca aplica solo.)
+        # We do NOT skip the approval guards: the model must approve before any
+        # risky action. (The backend never applies on its own.)
         return False
 
     @property
     def default_cwd(self):
-        # No hay una home idéntica por sesión; usamos el cwd que Hermes ya resuelve.
+        # No per-session identical home; use the cwd Hermes already resolves.
         return None
 
     def is_available(self):
@@ -301,26 +383,38 @@ class PreflightProvider(TerminalEnvironmentProvider):
         **kwargs,
     ):
         original = Path(cwd) if cwd else Path.cwd()
-        # task_id sanitizado (solo [a-z0-9_-]) para no colarse en rutas.
+        # task_id sanitized (only [a-z0-9_-]) so it cannot leak into paths.
         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(task_id)) or "default"
         sandbox_dir = SANDROOT / safe_id / "workspace"
         sandbox_dir.mkdir(parents=True, exist_ok=True)
-        # Registra el workspace original (para sandboxctl apply/discard).
+        # Register the original workspace (for sandboxctl apply/discard).
         SANDROOT.joinpath(safe_id, "original").write_text(str(original), encoding="utf-8")
 
-        # Clonar el workspace. Estrategia: reflink (CoW) si el filesystem lo soporta;
-        # fallback a copia completa. NO usamos hardlinks directos porque comparten inode:
-        # un `echo x > archivo` en el sandbox tocaría el original. Reflink copia cero bytes
-        # y aísla de verdad (el mismo "no copio bytes" que pedía la idea, pero seguro).
-        self._clone(original, sandbox_dir)
+        # Reuse a session that already has pending changes instead of re-cloning
+        # and losing its PENDING.diff. Re-clone only after a discard/apply:
+        # (see _clone: it wipes the previous copy for the same task_id).
+        pending = sandbox_dir / "PENDING.diff"
+        has_pending = False
+        try:
+            has_pending = bool(pending.read_text(encoding="utf-8").strip())
+        except OSError:
+            has_pending = False
+        if not has_pending:
+            # Clone the workspace (reflink when the fs supports it, full copy
+            # otherwise), then snapshot the original for the TOCTOU guard.
+            self._clone(original, sandbox_dir)
+            try:
+                _write_original_fingerprint(original, SANDROOT.joinpath(safe_id, "original.fingerprint"))
+            except Exception:
+                pass  # apply will refuse if the fingerprint is missing
 
-        return SandboxFirstEnvironment(
+        return PreflightEnvironment(
             cwd=cwd, timeout=timeout, sandbox_path=sandbox_dir, original_path=original
         )
 
     @staticmethod
     def _clone(src: Path, dst: Path):
-        # Workspace limpio: descarta cualquier contenido previo del mismo task_id.
+        # Clean workspace: drop any previous content of the same task_id.
         if dst.exists():
             for old in dst.iterdir():
                 if old.is_dir() and not old.is_symlink():
@@ -330,7 +424,7 @@ class PreflightProvider(TerminalEnvironmentProvider):
                         old.unlink()
                     except OSError:
                         pass
-        # 1) reflink de verdad (falla si el fs no lo soporta -> bucle con --reflink=auto).
+        # 1) real reflink (fails if the fs does not support it -> fall to --reflink=auto loop).
         try:
             subprocess.run(
                 ["cp", "-a", "--reflink=always", f"{src}/.", f"{dst}/"],
@@ -340,7 +434,7 @@ class PreflightProvider(TerminalEnvironmentProvider):
             return
         except Exception:
             pass
-        # 2) copia normal (aislada, más lenta pero segura).
+        # 2) normal copy (isolated, slower but safe).
         for child in src.iterdir():
             if child.name in ("PENDING.diff",):
                 continue

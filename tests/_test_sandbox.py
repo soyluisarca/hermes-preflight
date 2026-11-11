@@ -83,8 +83,8 @@ print("PASS 5: sandboxctl status lista la sesión")
 
 # apply (auto-responder 's' — apply NO es automático, lo confirmamos aquí sí)
 apply_run = subprocess.run(
-    ["bash", str(sbctl), "apply", "demo-test"],
-    input="s\n", capture_output=True, text=True, env={**os.environ},
+    ["bash", str(sbctl), "apply", "demo-test", "--yes"],
+    capture_output=True, text=True, env={**os.environ},
 )
 assert "Aplicado" in apply_run.stdout, f"apply falló: {apply_run.stdout} {apply_run.stderr}"
 assert not (ws / "subdir" / "a.txt").exists(), "apply no aplicó el borrado a.txt"
@@ -96,7 +96,7 @@ print("PASS 6: apply aplicó exactamente lo del diff (borró a.txt/b.txt, conser
 env2 = provider.create_environment(cwd=str(ws), timeout=15, task_id="discard-test")
 env2.execute("rm -f root.txt")
 (sb_root := Path(os.environ["SANDBOX_FIRST_ROOT"]))
-subprocess.run(["bash", str(sbctl), "discard", "discard-test"], capture_output=True, text=True, env={**os.environ})
+subprocess.run(["bash", str(sbctl), "discard", "discard-test", "--yes"], capture_output=True, text=True, env={**os.environ})
 assert (ws / "root.txt").exists(), "discard tocó el workspace real"
 assert not (sb_root / "discard-test").exists(), "discard no borró la sesión"
 print("PASS 7: discard no tocó el workspace real y limpió la sesión")

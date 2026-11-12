@@ -216,12 +216,15 @@ another profile's sessions.
 ├── bin/sandboxctl       # status | diff | apply | discard
 ├── tests/_test_sandbox.py # functional test (run: python3 tests/_test_sandbox.py)
 ├── tests/_probe_leak.py    # leak regression probe (run: python3 tests/_probe_leak.py)
+├── tests/_poc_evidence.py  # audited PoCs demo (run: python3 tests/_poc_evidence.py)
 └── README.md            # this file
 ```
 
 ## Quick verification
 
 ```bash
-python3 tests/_test_sandbox.py   # must end with: TODO PASS ✔
+python3 tests/_test_sandbox.py   # must end with: TODO PASS ✔ (30 PASS)
+python3 tests/_probe_leak.py     # must end with: TODO OK: sin fugas
+python3 tests/_poc_evidence.py   # demos the audited PoCs are mitigated
 hermes plugins validate ~/.hermes/plugins/preflight   # Validation passed, security scan safe
 ```

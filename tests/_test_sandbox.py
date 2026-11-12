@@ -26,11 +26,18 @@ Cubre (del más antiguo al más nuevo):
  21. clone usa el original RESUELTO (symlink/`..` no cuelan el TOCTOU),
  22. sandboxctl --help documenta multi-perfil (HERMES_HOME),
  23. apply muestra "N más líneas" y cómo ver el diff completo,
- 24. README aclara apply whole-workspace (rsync -a) y byte-exact no garantizado.
+ 24. README aclara apply whole-workspace (rsync -a) y byte-exact no garantizado,
+ 25. mensaje de bloqueo honesto: dice QUÉ escanea (never claims host unreachable),
+ 26. TMPDIR/TMP/TEMP pinneados a la copia; vars vacías ($EMPTY/etc) ya no alcanzan /etc,
+ 27. sandbox_root override: marker .preflight-root -> sandboxctl opera el root efectivo,
+ 28. ciclo post-apply: PENDING vacío + fingerprint refrescado -> misma task_id reutilizable,
+ 29. README confiesa por nombre $TMPDIR, bash script.sh, python3 -c, staging no fortaleza,
+ 30. staging root no es trust boundary (registro/fingerprint compartidos y documentados).
 """
 import json
 import os
 import pty
+import re
 import select
 import shutil
 import subprocess
@@ -509,8 +516,159 @@ assert "self-approve" in readme, "README debería declarar el límite de self-ap
 assert "cannot self-approve" not in readme.lower(), "README vuelve a sobre-prometer"
 bump(24)
 
+# --- 25) mensaje de bloqueo honesto: dice QUÉ escanea, no promete aislamiento ---
+# --- 26) TMPDIR/TMP/TEMP pinneados a la copia; vars vacías ya no alcanzan /etc ---
+# --- 27) sandbox_root override + sandboxctl: marker .preflight-root ---
+# --- 28) ciclo de vida post-apply: reusar el mismo task_id tras apply ---
+# --- 29) README confiesa POR NOMBRE las limitaciones ---
+# --- 30) staging root no es fortaleza: T1/T2b documentado y bloqueado en lo literal ---
+ws_hon = make_ws(prefix="ws-hon-")
+env_hon = provider.create_environment(cwd=str(ws_hon), timeout=15, task_id="honest-msg")
+r_hon = env_hon.execute("cat ../escape.txt 2>&1")  # bloqueo real de rel-escape
+assert r_hon["exit_code"] == 1, f"guard no bloqueó: {r_hon!r}"
+msg = r_hon["output"].lower()
+assert "blocked by preflight" in msg, f"mensaje no preflight: {r_hon['output']}"
+assert "literal command strings" in msg, f"mensaje no declara qué escanea: {r_hon['output']}"
+assert "variable expansion" in msg, f"mensaje no confiesa var-expansion: {r_hon['output']}"
+assert "see readme" in msg, f"mensaje no apunta a Honest limitations: {r_hon['output']}"
+r_hon2 = env_hon.execute("echo x > /etc/out 2>&1")  # write-redirection real
+assert r_hon2["exit_code"] == 1 and "literal command strings" in r_hon2["output"].lower(), f"write guard msg: {r_hon2['output']}"
+# la frase absoluta NO existe en el código ni en docs (fuera de tests)
+for fname in ("__init__.py", "README.md", "bin/sandboxctl", "plugin.yaml"):
+    content = (PLUGIN_DIR / fname).read_text(errors="replace")
+    assert "nothing outside the copy is written or read" not in content.lower(), f"{fname} vuelve a prometer aislamiento total"
+    assert "nothing is written outside the sandbox" not in content.lower(), f"{fname} vuelve a prometer aislamiento total"
+assert "never claims the host is unreachable" in readme, "README no declara que el plugin no promete aislamiento total"
+bump(25)
+
+# --- 26) TMPDIR/TMP/TEMP pinneados a la copia; vars vacías ya no alcanzan /etc ---
+host_tmp = Path(tempfile.mkdtemp(prefix="host-controller-tmp-"))
+ws_tmp = make_ws(prefix="ws-tmp-")
+env_tmp = provider.create_environment(cwd=str(ws_tmp), timeout=15, task_id="tmp-pin")
+# el hijo ve TMPDIR apuntando a la copia, no al host
+r_tmp = env_tmp.execute("echo $TMPDIR")
+assert r_tmp["exit_code"] == 0, f"probe TMPDIR falló: {r_tmp!r}"
+assert str(env_tmp.sandbox_path / ".preflight-tmp") in r_tmp["output"], f"TMPDIR no pinneado: {r_tmp['output']}"
+# escribir a $TMPDIR cae en la copia, NO en el host
+r_w = env_tmp.execute("echo PWN > $TMPDIR/pwned.txt")
+assert r_w["exit_code"] == 0, f"write a TMPDIR falló: {r_w!r}"
+assert not (host_tmp / "pwned.txt").exists(), "el write a $TMPDIR llegó al host"
+assert (env_tmp.sandbox_path / ".preflight-tmp" / "pwned.txt").exists(), "el write a $TMPDIR no quedó en la copia"
+# mktemp también cae dentro
+r_mk = env_tmp.execute("mktemp -d")
+assert r_mk["exit_code"] == 0 and ".preflight-tmp" in r_mk["output"], f"mktemp no pinneado a la copia: {r_mk['output']}"
+# PENDING.diff y apply deben ignorar .preflight-tmp
+pend_tmp = (env_tmp.sandbox_path / "PENDING.diff").read_text()
+assert ".preflight-tmp" not in pend_tmp, "PENDING.diff lista el TMPDIR pinneado"
+# vars vacías: $EMPTY/etc/passwd == /etc/passwd -> bloqueado, sin leer host
+r_empty = env_tmp.execute("cat $EMPTY/etc/passwd 2>&1")
+assert r_empty["exit_code"] == 1, f"var vacía alcanzó /etc: {r_empty!r}"
+assert "root:" not in r_empty["output"], "var vacía leyó /etc/passwd del host"
+assert "etc/passwd" in r_empty["output"], f"el guard no señaló el path expandido: {r_empty['output']}"
+# $HOME (pinneado) sigue funcionando: no es falso positivo
+r_home = env_tmp.execute("echo ok > $HOME/homefile.txt")
+assert r_home["exit_code"] == 0, f"$HOME pinneado roto por expansión: {r_home!r}"
+assert (env_tmp.sandbox_path / "homefile.txt").exists(), "write a $HOME no quedó en la copia"
+shutil.rmtree(host_tmp, ignore_errors=True)
+bump(26)
+
+# --- 27) sandbox_root override + sandboxctl: marker .preflight-root ---
+override = Path(tempfile.mkdtemp(prefix="cfg-override-")) / "custom-root"
+prov_ovr = Provider(sandbox_root=str(override))
+ws_ov = make_ws(prefix="ws-ov-")
+env_ov = prov_ovr.create_environment(cwd=str(ws_ov), timeout=15, task_id="ov-sess")
+# el marker existe bajo el root DERIVADO y apunta al override
+marker = SB_ROOT / ".preflight-root"
+assert marker.exists(), "no se escribió el marker .preflight-root"
+assert marker.read_text().strip() == str(override), f"marker apunta mal: {marker.read_text()}"
+# sandboxctl status ve la sesión del override
+st_ov = run_sbctl("status")
+assert "ov-sess" in st_ov.stdout, f"status no ve la sesión del override: {st_ov.stdout} {st_ov.stderr}"
+assert override.resolve().as_posix() in st_ov.stdout, f"status no usa el root efectivo: {st_ov.stdout}"
+# apply y discard funcionan contra el override (TTY de verdad)
+env_ov.execute("echo new > new.txt")
+code_ov, out_ov = run_sbctl_tty("apply", "ov-sess", answer="s\n")
+assert code_ov == 0, f"apply con override falló: code={code_ov} out={out_ov}"
+assert (ws_ov / "new.txt").exists(), "apply con override no aplicó al workspace real"
+code_ov2, out_ov2 = run_sbctl_tty("discard", "ov-sess", answer="s\n")
+assert code_ov2 == 0, f"discard con override falló: code={code_ov2} out={out_ov2}"
+assert not (override / "ov-sess").exists(), "discard con override no borró la sesión"
+# el CLI NO afirma que deriva el override: README + plugin.yaml + --help
+readme = (PLUGIN_DIR / "README.md").read_text()
+assert "mirrors that derivation" not in readme, "README vuelve a afirmar mirror de override"
+yaml_text = (PLUGIN_DIR / "plugin.yaml").read_text()
+assert "mirrors" not in yaml_text.lower() or "does not" in yaml_text.lower(), "plugin.yaml afirma mirror"
+help_ov = run_sbctl("--help").stdout
+assert "mirrors that derivation" not in help_ov, "sandboxctl --help afirma mirror"
+assert ".preflight-root" in help_ov, "sandboxctl --help no documenta el marker"
+bump(27)
+
+# --- 28) ciclo de vida post-apply: reusar el mismo task_id tras apply ---
+ws_life = make_ws(prefix="ws-life-")
+env_life = provider.create_environment(cwd=str(ws_life), timeout=15, task_id="life-post")
+assert env_life.execute("echo one > one.txt")["exit_code"] == 0
+code_l1, out_l1 = run_sbctl_tty("apply", "life-post", answer="s\n")
+assert code_l1 == 0, f"apply#1 falló: code={code_l1} out={out_l1}"
+assert (ws_life / "one.txt").exists(), "apply#1 no aplicó"
+# tras apply: PENDING vacío + fingerprint refrescado (sesión limpia)
+assert not (env_life.sandbox_path / "PENDING.diff").read_text().strip(), "PENDING.diff no se vació tras apply"
+# la MISMA task_id se puede reutilizar: nuevo create_environment re-clona del estado aplicado
+env_life2 = provider.create_environment(cwd=str(ws_life), timeout=15, task_id="life-post")
+assert env_life2.execute("echo two > two.txt")["exit_code"] == 0
+code_l2, out_l2 = run_sbctl_tty("apply", "life-post", answer="s\n")
+assert code_l2 == 0, f"2º apply (misma task_id) debería funcionar tras el fix: code={code_l2} out={out_l2}"
+assert "CHANGED" not in out_l2.upper(), f"2º apply falló por fingerprint viejo: {out_l2}"
+assert (ws_life / "two.txt").exists(), "2º apply no aplicó el nuevo cambio"
+# y una tercera ronda sigue funcionando (ciclo repetible)
+env_life3 = provider.create_environment(cwd=str(ws_life), timeout=15, task_id="life-post")
+assert env_life3.execute("echo three > three.txt")["exit_code"] == 0
+code_l3, out_l3 = run_sbctl_tty("apply", "life-post", answer="s\n")
+assert code_l3 == 0, f"3er apply (misma task_id) falló: code={code_l3} out={out_l3}"
+assert (ws_life / "three.txt").exists(), "3er apply no aplicó"
+bump(28)
+
+# --- 29) README confiesa POR NOMBRE las limitaciones ---
+low = readme.lower()
+assert "$tmpdir" in low, "README no confiesa $TMPDIR por nombre"
+assert "bash\n  script.sh" in readme or "bash script.sh" in readme, "README no confiesa bash script.sh por nombre"
+assert "python3 -c" in readme, "README no confiesa python3 -c por nombre"
+assert "not a trust boundary" in low, "README no declara que el staging root NO es trust boundary"
+assert "$preflight_root/victim/original" in low, "README no nombra el registro de otra sesión ($PREFLIGHT_ROOT/victim/original)"
+assert "fingerprint" in low and "writable" in low, "README no confiesa que el fingerprint es escribible"
+assert "human tty confirmation" in low or "tty confirmation" in low, "README no declara que la TTY humana es el límite real"
+bump(29)
+
+# --- 30) staging root NO es fortaleza: T1/T2b confesados por nombre (doc, no silencio) ---
+# El brief pide documentar que desde la copia un agente PUEDE leer/sobrescribir
+# el registro de otra sesión vía $PREFLIGHT_ROOT (el fingerprint es escribible)
+# y que la TTY humana es el límite real. Verificamos que NO se promete lo
+# contrario: el área de staging es un workspace compartido y el README lo dice.
+ws_vict = make_ws(prefix="ws-vict-")
+env_vict = provider.create_environment(cwd=str(ws_vict), timeout=15, task_id="victim30")
+# observable 1: el runtime inyecta PREFLIGHT_ROOT al hijo (el staging root)
+r_root = env_vict.execute("echo $PREFLIGHT_ROOT")
+assert r_root["exit_code"] == 0 and SB_ROOT.as_posix() in r_root["output"], f"PREFLIGHT_ROOT no inyectado: {r_root['output']}"
+# observable 2: los registros viven como archivos planos bajo el root compartido
+orig_file = SB_ROOT / "victim30" / "original"
+fp_file = SB_ROOT / "victim30" / "original.fingerprint"
+assert orig_file.exists() and fp_file.exists(), "el registro/fingerprint no existen (staging inexistente)"
+assert orig_file.read_text().strip() == str(ws_vict), "registro del victim corrupto"
+# observable 3: el fingerprint es un archivo plano (modo 0o644 -> cualquier usuario
+# del host puede escribir si el dir lo permite; el README lo declara "writable")
+assert fp_file.stat().st_mode & 0o666 != 0, "fingerprint no es escribible por el usuario (contrario a la confesión)"
+# confesión por nombre en el README (ya cubierta en 29; aquí el espiral completo)
+flat_readme = re.sub(r"\s+", " ", readme)
+assert "read or overwrite another session's registration record" in flat_readme, "README no confiesa T1/T2b por nombre"
+assert "original.fingerprint" in readme, "README no nombra el fingerprint escribible"
+assert "preflight-root" in readme, "README no documenta el marker del root"
+# limpieza: discard del victim para no dejar basura
+code_v, out_v = run_sbctl_tty("discard", "victim30", answer="s\n")
+assert code_v == 0, f"discard victim30 falló: {out_v}"
+bump(30)
+
 # --- cleanup de temporales grandes (opcional, no destructivo) ---
-for d in (ws, ws_sym, ws_ok, ws_ft, ws_e, ws_fp, ws_fp2, ws_out, ws_in, ws_sec, ws_env, ws_big):
+for d in (ws, ws_sym, ws_ok, ws_ft, ws_e, ws_fp, ws_fp2, ws_out, ws_in, ws_sec, ws_env, ws_big,
+          ws_hon, ws_tmp, ws_ov, ws_life, ws_vict):
     shutil.rmtree(d, ignore_errors=True)
 
 print(f"\nTODO PASS ✔ ({pass_count} PASS)")

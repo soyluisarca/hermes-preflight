@@ -36,21 +36,36 @@ Security notes (read carefully):
     export HERMES_HOME=<that profile's hermes home> so this command targets
     THAT profile's sessions, e.g.:
         export HERMES_HOME=~/.hermes/profiles/<profile>
-    PREFLIGHT_ROOT is transport-only (set by the backend for child scripts)
-    and MUST match the derived root; a mismatched value is refused.
+    A per-profile plugin-config override ("sandbox_root") is NOT derived from
+    the environment: the backend writes the effective root into a one-line
+    marker at <derived root>/.preflight-root, and this CLI reads that marker.
+    If the marker is missing, the CLI uses the derived root. The marker is a
+    convenience, not a security boundary (the staging root is writable by the
+    sandboxed agent).
+  * PREFLIGHT_ROOT is transport-only (set by the backend for child scripts)
+    and MUST match the effective root (marker or derived); a mismatched value
+    is refused.
   * apply is WHOLE-WORKSPACE: it syncs the whole copy (rsync -a, no global
     --delete). PENDING.diff is the review gate for CONTENT, not a byte-exact
     preview: mtimes/permissions can change without appearing in the diff.
+    Files under the pinned TMPDIR (.preflight-tmp) are never applied.
+  * After a successful apply the session is left CLEAN: PENDING.diff is
+    emptied and the fingerprint is refreshed, so reusing the same task_id
+    legitimately starts a fresh review (the next create_environment re-clones
+    from the applied state). A second apply without new changes will then
+    report "no pending changes" instead of a stale CHANGED.
 EOF
   exit 0
 fi
 
-# The sandbox root must match the backend's active Hermes home (each profile
-# gets its own namespace). The backend derives it from the active Hermes home
-# + /sandbox (and honors a per-profile plugin config key "sandbox_root"); this
-# script mirrors that. PREFLIGHT_ROOT is accepted as transport for scripts/tests
-# but is NEVER trusted on its own to decide WHERE a destructive command runs:
-# it must equal the root derived from HERMES_HOME (or $HOME/.hermes).
+# The sandbox root must match the backend's effective root (each profile gets
+# its own namespace). The backend derives the default from the active Hermes
+# home + /sandbox and MAY honor a per-profile plugin config key
+# "sandbox_root"; when it does, it writes a one-line marker,
+# .preflight-root, INSIDE the derived root. So: derive EXPECTED_ROOT, then
+# read the marker if present; that is the effective root. PREFLIGHT_ROOT is
+# accepted as transport for scripts/tests but is NEVER trusted on its own to
+# decide WHERE a destructive command runs: it must equal the effective root.
 if [[ -n "${HERMES_HOME:-}" ]]; then
   EXPECTED_ROOT="${HERMES_HOME%/}/sandbox"
 else
@@ -58,14 +73,22 @@ else
 fi
 EXPECTED_ROOT="$(realpath -m "$EXPECTED_ROOT" 2>/dev/null || echo "$EXPECTED_ROOT")"
 
+EFFECTIVE_ROOT="$EXPECTED_ROOT"
+if [[ -f "$EXPECTED_ROOT/.preflight-root" ]]; then
+  marker="$(cat "$EXPECTED_ROOT/.preflight-root" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -n "$marker" ]]; then
+    EFFECTIVE_ROOT="$(realpath -m "$marker" 2>/dev/null || echo "$marker")"
+  fi
+fi
+
 if [[ -n "${PREFLIGHT_ROOT:-}" ]]; then
   ROOT="$PREFLIGHT_ROOT"
 else
-  ROOT="$EXPECTED_ROOT"
+  ROOT="$EFFECTIVE_ROOT"
 fi
 ROOT="$(realpath -m "$ROOT" 2>/dev/null || echo "$ROOT")"
-if [[ "$ROOT" != "$EXPECTED_ROOT" ]]; then
-  echo "✖ refusing PREFLIGHT_ROOT=$PREFLIGHT_ROOT: it is not this profile's sandbox root ($EXPECTED_ROOT)." >&2
+if [[ "$ROOT" != "$EFFECTIVE_ROOT" ]]; then
+  echo "✖ refusing PREFLIGHT_ROOT=$PREFLIGHT_ROOT: it is not this profile's sandbox root (effective root: $EFFECTIVE_ROOT)." >&2
   echo "  Export HERMES_HOME=<profile hermes home> (see: sandboxctl --help) so the command targets YOUR sessions." >&2
   exit 1
 fi
@@ -149,21 +172,12 @@ esac
 # Fingerprint of the real workspace at clone time (TOCTOU guard).
 FP="$ROOT/$task_id/original.fingerprint"
 
-case "$cmd" in
-  diff)
-    [[ -f "$WS/PENDING.diff" ]] && cat "$WS/PENDING.diff" || echo "(no PENDING.diff)"
-    ;;
-
-  apply)
-    # 0) TOCTOU: the real workspace must not have changed since the clone.
-    #    Without a fingerprint we cannot guarantee it -> do not apply.
-    if [[ ! -f "$FP" ]]; then
-      echo "✖ Session created without an integrity fingerprint; cannot guarantee the real workspace did not change." >&2
-      echo "  Discard it and recreate to apply safely:" >&2
-      echo "    sandboxctl discard $task_id" >&2
-      exit 1
-    fi
-    current_fp="$(python3 - "$ORIG" <<'PYEOF'
+# compute_fp <path>: sha256 fingerprint of a tree, same format as the backend's
+# _write_original_fingerprint (path<TAB>mtime_ns<TAB>size<TAB>sha256<TAB>kind).
+# Used before apply to detect real changes since the clone, and after a
+# successful apply to refresh the reference so a reused task_id starts clean.
+compute_fp() {
+  python3 - "$1" <<'PYEOF'
 import hashlib, os, sys
 from pathlib import Path
 root = Path(sys.argv[1])
@@ -201,7 +215,23 @@ for _root, dirs, files in os.walk(root):
         lines.append(f"{os.path.join(rel_root, f)}\t{st.st_mtime_ns}\t{st.st_size}\t{h}\tf")
 print("\n".join(sorted(lines)))
 PYEOF
-)"
+}
+
+case "$cmd" in
+  diff)
+    [[ -f "$WS/PENDING.diff" ]] && cat "$WS/PENDING.diff" || echo "(no PENDING.diff)"
+    ;;
+
+  apply)
+    # 0) TOCTOU: the real workspace must not have changed since the clone.
+    #    Without a fingerprint we cannot guarantee it -> do not apply.
+    if [[ ! -f "$FP" ]]; then
+      echo "✖ Session created without an integrity fingerprint; cannot guarantee the real workspace did not change." >&2
+      echo "  Discard it and recreate to apply safely:" >&2
+      echo "    sandboxctl discard $task_id" >&2
+      exit 1
+    fi
+    current_fp="$(compute_fp "$ORIG")"
     if [[ "$current_fp" != "$(cat "$FP")" ]]; then
       echo "✖ The real workspace CHANGED since the copy was cloned (content, mtime or permissions). Re-sync:" >&2
       echo "    sandboxctl discard $task_id" >&2
@@ -260,10 +290,11 @@ PYEOF
     fi
 
     if [[ "$ans" =~ ^[sSyY]$ ]]; then
-      # 1) new/modified content: rsync WITHOUT --delete. No file is removed from
-      #    the real workspace here (a file created after the clone survives; the
-      #    fingerprint above already guarantees none appeared).
-      rsync -a --exclude=PENDING.diff "$WS/" "$ORIG/"
+      # 1) new/modified content: rsync WITHOUT --delete and WITHOUT the pinned
+      #    TMPDIR (.preflight-tmp). No file is removed from the real workspace
+      #    here (a file created after the clone survives; the fingerprint above
+      #    already guarantees none appeared).
+      rsync -a --exclude=PENDING.diff --exclude=.preflight-tmp "$WS/" "$ORIG/"
       # 2) explicit deletions: only the paths the sandbox removed (present in
       #    ORIG, absent in WS). Never a global --delete. With a valid fingerprint
       #    no user file appeared after the clone, so the set is exact; the
@@ -283,9 +314,18 @@ PYEOF
             rm -f -- "$target"
           fi
         fi
-      done < <(rsync -av --delete --dry-run --exclude=PENDING.diff "$WS/" "$ORIG/" 2>/dev/null \
+      done < <(rsync -av --delete --dry-run --exclude=PENDING.diff --exclude=.preflight-tmp "$WS/" "$ORIG/" 2>/dev/null \
                 | grep '^deleting ' | sed 's/^deleting //' || true)
+      # 3) Post-apply lifecycle: the session is now IN SYNC with the real
+      #    workspace. Empty PENDING.diff (the applied changes no longer need
+      #    review) and refresh the fingerprint so reusing the same task_id
+      #    legitimately starts a fresh review instead of failing with a stale
+      #    "CHANGED". Re-clone happens on the next create_environment.
+      : > "$WS/PENDING.diff"
+      current_fp="$(compute_fp "$ORIG")"
+      printf '%s\n' "$current_fp" > "$FP"
       echo "✔ Applied."
+      echo "  Session '$task_id' is clean: PENDING.diff emptied, fingerprint refreshed (reuse the id for a fresh review)."
     else
       echo "✖ Apply cancelled."
       exit 1

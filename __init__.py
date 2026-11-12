@@ -2,9 +2,12 @@
 workspace.
 
 Every command executes inside a local copy (reflink full copy) of the real
-workspace. The real workspace is NEVER touched. After each command a diff is
-accumulated in PENDING.diff. Applying (selective rsync copy -> real) and
-discarding are EXPLICIT actions that never happen on their own.
+workspace. The real workspace is NEVER touched directly: the file tools run
+inside the copy too (uses_host_filesystem=False). After each command a diff is
+accumulated in PENDING.diff. Applying (whole-workspace sync copy -> real) and
+discarding are EXPLICIT actions that never happen on their own; apply is a
+single whole-workspace approval (PENDING.diff is the exact-diff review gate)
+and requires human confirmation on a terminal (an agent cannot self-approve).
 """
 
 from __future__ import annotations
@@ -19,15 +22,23 @@ from pathlib import Path
 
 from agent.terminal_env_provider import TerminalEnvironmentProvider
 
-# Root directory for sandboxes (root of PKG, not exposed to network or user).
-# PREFLIGHT_ROOT is the canonical variable; SANDBOX_FIRST_ROOT is kept as a
-# fallback so existing sessions, cron configs and the standalone test keep
-# working without changes.
-SANDROOT = Path(
-    os.getenv("PREFLIGHT_ROOT")
-    or os.getenv("SANDBOX_FIRST_ROOT")
-    or (Path.home() / ".hermes" / "sandbox")
-)
+def _derive_sandroot() -> Path:
+    """Default sandbox root: the active Hermes home + /sandbox."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "sandbox"
+
+
+# Root directory for sandboxes.
+#
+# Derived from the ACTIVE Hermes home (hermes_constants.get_hermes_home()) so
+# each profile gets its own sandbox namespace instead of every profile sharing
+# ~/.hermes/sandbox. The module-level SANDROOT is the default; a per-profile
+# override is applied by PreflightProvider._sandroot() (plugin config key
+# "sandbox_root", set in plugin.yaml / plugins.entries.<id>.settings). The
+# legacy PREFLIGHT_ROOT / SANDBOX_FIRST_ROOT env vars are NOT read here anymore
+# — overrides now live in plugin config, not the environment.
+SANDROOT = _derive_sandroot()
 
 # Exact environment variable names that must never reach the subprocess (secrets).
 _STRIP_ENV_KEYS = frozenset({
@@ -140,13 +151,16 @@ class PreflightEnvironment:
     HONEST contract (we do not claim what we do not do):
       - NOT a container. The command runs in a LOCAL copy (reflink/copy) of the
         workspace, but the process is a host process.
-      - uses_host_filesystem = True: the agent's file-tools read the REAL
-        workspace, not the copy. The agent SEES the real one, EXECUTES on the
-        copy and APPLIES with explicit approval.
+      - uses_host_filesystem = False: the agent's file-tools go through
+        execute() inside the COPY, so write_file/patch/edit never touch the real
+        workspace directly and always land behind the copy/diff/apply gate. The
+        agent SEES the copy, EXECUTES on the copy and APPLIES with explicit
+        approval. (Setting this True would let file-tools bypass the gate and
+        break the PENDING.diff fingerprint check.)
       - is_local = True: runs on the local machine, not remote.
     """
 
-    uses_host_filesystem = True
+    uses_host_filesystem = False
     is_local = True
     is_container = False
 
@@ -220,6 +234,46 @@ class PreflightEnvironment:
                 problems.append(tok)
         return problems
 
+    def _block_relative_escape(self, command: str) -> str | None:
+        """Reject relative path tokens that walk OUT of the copy via ``..``.
+
+        Best-effort, like the other guards (the shell runs on the host, so this
+        is a safety net, not a wall). An absolute path is handled by
+        ``_block_host_absolute_paths``; this catches ``..``-style traversal that
+        resolves outside the sandbox copy relative to the copy's cwd. ``..``
+        segments that stay inside the copy (e.g. ``../peer`` where ``peer`` is
+        a sibling inside the workspace) are allowed.
+        """
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = [m.group(0) for m in re.finditer(r"\S+", command)]
+        cwd = Path(self.sandbox_cwd)
+        for tok in tokens:
+            if not tok.startswith("."):
+                continue
+            # Only care about path-ish tokens (not e.g. `test -x ..` discussions,
+            # but erring toward blocking is fine for a command-substitution risk).
+            if tok in (".", ".."):
+                candidate = cwd / tok
+            elif tok.startswith("./") or tok.startswith("../"):
+                candidate = cwd / tok
+            else:
+                continue
+            try:
+                resolved = candidate.resolve(strict=False)
+                under = os.path.commonpath([str(resolved), str(cwd)]) == str(cwd)
+            except Exception:
+                under = False
+            if not under:
+                return (
+                    f"Blocked by preflight: relative path escapes the sandbox "
+                    f"copy ({tok}). Nothing outside the copy is written or read."
+                )
+        # Also flag explicit `..` traversals to the root of any drive iff they
+        # would escape; handled above. Nothing more to scan.
+        return None
+
     def _block_writes_outside(self, command: str):
         """Reject explicit *writes* (redirection or >) to absolute paths outside the copy."""
         for m in re.finditer(r"[12]?>+\s*('([^']*)'|\"([^\"]*)\"|(\S+))", command):
@@ -285,6 +339,12 @@ class PreflightEnvironment:
         # HOME ALWAYS points inside the copy: `cd ~`, `~/.bashrc`, git config, etc.
         # never escape to the real user directory, even if the real HOME leaks in.
         env["HOME"] = str(self.sandbox_path)
+        # Pass the sandbox ROOT to children (notably `sandboxctl` invoked from inside
+        # a command) so they target THIS profile's root. HERMES_HOME is stripped by
+        # the sanitizer and HOME is pinned to the copy, so a child would otherwise not
+        # know where the real sessions live. PREFLIGHT_ROOT is plugin-internal
+        # transport now (not a user config surface).
+        env["PREFLIGHT_ROOT"] = str(self.sandbox_path.parent.parent)
         return env
 
     def execute(self, command: str, timeout: int | None = None, **kwargs):
@@ -300,6 +360,10 @@ class PreflightEnvironment:
         write_err = self._block_writes_outside(command)
         if write_err:
             return {"output": write_err, "exit_code": 1, "returncode": 1}
+
+        rel_err = self._block_relative_escape(command)
+        if rel_err:
+            return {"output": rel_err, "exit_code": 1, "returncode": 1}
 
         paths = self._block_host_absolute_paths(command, self.sandbox_path)
         if paths:
@@ -389,14 +453,25 @@ class PreflightProvider(TerminalEnvironmentProvider):
     # NOT a container: the command runs in a LOCAL copy (reflink/copy) of the
     # real workspace. The process is a host process; no kernel or network
     # isolation. is_container=False is the honest option — we declare a
-    # "dry-run gate", not a sandbox. The agent's file-tools keep reading the REAL
-    # workspace (uses_host_filesystem).
+    # "dry-run gate", not a sandbox. uses_host_filesystem = False so the
+    # agent's file-tools run inside the copy via execute() and never write the
+    # real workspace directly (every change lands behind the copy/diff/apply
+    # gate).
     is_remote = False
     is_container = False
 
-    def __init__(self):
-        # late import so the plugin loads even if the root package is not imported
-        pass
+    def __init__(self, *, sandbox_root: str | Path | None = None):
+        # A per-profile override read from plugin config (key "sandbox_root");
+        # when unset we fall back to the module default SANDROOT (active Hermes
+        # home + /sandbox). Late import so the plugin loads even when the root
+        # package is not imported.
+        self._sandbox_root = Path(sandbox_root) if sandbox_root else None
+
+    def _sandroot(self) -> Path:
+        """Effective sandbox root for this provider (config override or default)."""
+        if self._sandbox_root is not None:
+            return self._sandbox_root
+        return SANDROOT
 
     @property
     def description(self):
@@ -431,12 +506,18 @@ class PreflightProvider(TerminalEnvironmentProvider):
         **kwargs,
     ):
         original = Path(cwd) if cwd else Path.cwd()
+        # Refuse to clone the user's home or Hermes home (point: HOME / ~/.hermes
+        # must never be the source of a sandbox copy). Cloning the home directory
+        # copies it over itself, walks the whole tree via the copytree fallback
+        # (filling the disk) and snapshots every secret under ~ into the copy.
+        self._reject_forbidden_original(original)
         # task_id sanitized (only [a-z0-9_-]) so it cannot leak into paths.
         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(task_id)) or "default"
-        sandbox_dir = SANDROOT / safe_id / "workspace"
+        sandbox_root = self._sandroot()
+        sandbox_dir = sandbox_root / safe_id / "workspace"
         sandbox_dir.mkdir(parents=True, exist_ok=True)
         # Register the original workspace (for sandboxctl apply/discard).
-        SANDROOT.joinpath(safe_id, "original").write_text(str(original), encoding="utf-8")
+        sandbox_root.joinpath(safe_id, "original").write_text(str(original), encoding="utf-8")
 
         # Reuse a session that already has pending changes instead of re-cloning
         # and losing its PENDING.diff. Re-clone only after a discard/apply:
@@ -452,13 +533,65 @@ class PreflightProvider(TerminalEnvironmentProvider):
             # otherwise), then snapshot the original for the TOCTOU guard.
             self._clone(original, sandbox_dir)
             try:
-                _write_original_fingerprint(original, SANDROOT.joinpath(safe_id, "original.fingerprint"))
+                _write_original_fingerprint(original, sandbox_root.joinpath(safe_id, "original.fingerprint"))
             except Exception:
                 pass  # apply will refuse if the fingerprint is missing
 
         return PreflightEnvironment(
             cwd=cwd, timeout=timeout, sandbox_path=sandbox_dir, original_path=original
         )
+
+    def _reject_forbidden_original(self, original: Path) -> None:
+        """Refuse to clone the user's home or Hermes home, or a path that
+        contains the sandbox root.
+
+        ``cp -a ~/.hermes/sandbox/... ~/`` would copy the copy onto itself,
+        the copytree fallback recurses until the disk fills, and every secret
+        under ``~`` gets snapshotted into the copy. Raise a clear error asking
+        the user to ``cd`` into a project directory instead.
+        """
+        try:
+            orig_res = original.resolve()
+        except Exception:
+            orig_res = original.absolute()
+        home = Path.home().resolve()
+        sand_root = self._sandroot().resolve()
+        hermes_homes = set()
+        try:
+            import hermes_constants
+
+            hh = hermes_constants.get_hermes_home().resolve()
+            hermes_homes.add(hh)
+            hermes_homes.add(hh.parent)  # convenience: ~/.hermes == home of home
+        except Exception:
+            pass
+
+        def under(a: Path, b: Path) -> bool:
+            try:
+                return os.path.commonpath([str(a), str(b)]) == str(b)
+            except Exception:
+                return False
+
+        bad = False
+        reason = ""
+        if orig_res == home:
+            bad = True
+            reason = f"refusing to clone your home directory ({orig_res})"
+        elif any(orig_res == h for h in hermes_homes):
+            bad = True
+            reason = f"refusing to clone the Hermes home directory ({orig_res})"
+        elif sand_root and (under(orig_res, sand_root) or under(sand_root, orig_res)):
+            bad = True
+            reason = (
+                f"refusing to clone a path that overlaps the sandbox root "
+                f"({orig_res} vs {sand_root})"
+            )
+        if bad:
+            raise ValueError(
+                f"preflight: {reason}. This would copy the workspace onto itself "
+                f"and snapshot every secret under it. cd into a project directory "
+                f"first, then run the command there."
+            )
 
     @staticmethod
     def _clone(src: Path, dst: Path):
@@ -499,4 +632,13 @@ class PreflightProvider(TerminalEnvironmentProvider):
 
 
 def register(ctx):
-    ctx.register_terminal_environment_provider(PreflightProvider())
+    # Per-profile sandbox root override from plugin config (key "sandbox_root").
+    # When unset, the provider falls back to the active Hermes home + /sandbox.
+    overrides = {}
+    try:
+        root = ctx.get_config("sandbox_root")
+        if root:
+            overrides["sandbox_root"] = str(root)
+    except Exception:
+        pass  # no readable config -> default sandbox root
+    ctx.register_terminal_environment_provider(PreflightProvider(**overrides))

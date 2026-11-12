@@ -3,3 +3,15 @@ version: 0.1.0
 description: "Preflight dry-run gate: runs each command in a throwaway workspace copy (isolated), shows the exact diff, and applies only what you explicitly approve."
 requires_hermes: ">=0.22.0"
 kind: backend
+# Plugin config keys (set under plugins.entries.<id>.settings in config.yaml):
+#   sandbox_root: string (optional)
+#     Per-profile sandbox root override. When unset, the sandbox root is
+#     derived from the ACTIVE Hermes home (hermes_constants.get_hermes_home())
+#     + /sandbox, so every profile gets its own sandbox namespace. The legacy
+#     PREFLIGHT_ROOT / SANDBOX_FIRST_ROOT environment variables are no longer
+#     read by the backend — use this key instead.
+config_schema:
+  sandbox_root:
+    type: string
+    required: false
+    description: "Optional per-profile sandbox root override. Defaults to the active Hermes home + /sandbox."

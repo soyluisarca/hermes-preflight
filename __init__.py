@@ -106,6 +106,49 @@ def _sanitize_env(env: dict) -> dict:
         and not any(k.upper().endswith(s) for s in _STRIP_ENV_SUFFIX)
     }
 
+# Honest note appended to every path guard message. The guards scan the
+# LITERAL command string; variable expansion and scripts invoked from inside
+# the command (bash file.sh, python3 -c) run beyond what a string scan can
+# see, so the plugin NEVER claims the host is unreachable — it says what it
+# scans and points to the README for the honest limitations.
+_HONEST_NOTE = (
+    "Note: only literal command strings are scanned; variable expansion "
+    "and invoked scripts (bash file.sh, python3 -c) can still touch the "
+    "host - see README 'Honest limitations'."
+)
+
+
+def _expand_var_tokens(token: str, env: dict) -> str:
+    """Best-effort ``$VAR``/``${VAR}`` expansion for UNSET/EMPTY variables.
+
+    The path guards must judge ``cat $EMPTY/etc/passwd`` the way bash will run
+    it: EMPTY is unset, so bash sees ``/etc/passwd`` — and the guard must see
+    the same. We expand ONLY variables that are absent or empty in the child's
+    env (they expand to the empty string exactly like bash without ``set -u``
+    does, which turns an absolute-looking residue into a real absolute path).
+
+    Variables that ARE set are left untouched for bash: expanding them here
+    would manufacture false positives ($PATH, $TMPDIR with a long value, a
+    staging-root path such as $PREFLIGHT_ROOT/... are all legitimate or
+    best-effort-covered strings). This is a documented heuristic: an attacker
+    can still build a path from set variables inside the command; the guards
+    close the empty-variable class, not the whole language.
+    """
+    if "$" not in token:
+        return token
+
+    def _repl(m: re.Match) -> str:
+        name = m.group(1) or m.group(2)
+        # Only absent/empty variables are expanded (to ""). Present variables
+        # keep their literal $VAR text so the guard analyzes the raw command.
+        return "" if env.get(name, "") == "" else m.group(0)
+
+    return re.sub(
+        r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+        _repl,
+        token,
+    )
+
 # Privilege-escalation tokens. They are concatenated on purpose: the plugin
 # security scanner mistakes the literal for a REAL use of sudo; here we only
 # BLOCK it.
@@ -184,6 +227,32 @@ def _redact_sensitive_line(line: str) -> str:
     if _SECRET_VALUE_RE.search(line):
         return _SECRET_VALUE_RE.sub("<redacted>", line)
     return line
+
+
+def _strip_tmpdir(body: str) -> str:
+    """Drop every diff hunk touching ``<copy>/.preflight-tmp``.
+
+    TMPDIR is pinned INSIDE the copy, so any tool honoring $TMPDIR leaves
+    files under the copy that must NOT show up in the review view nor be
+    applied to the real workspace. We cannot exclude the name via `git diff
+    --no-index` pathspec magic, so we strip the matching hunks here: once a
+    hunk header (``diff ``/``Only in``) mentions ``.preflight-tmp``, every
+    line until the next file header is dropped. The same exclusion is applied
+    by `sandboxctl apply` (rsync --exclude=.preflight-tmp).
+    """
+    out: list[str] = []
+    skip = False
+    for line in body.splitlines():
+        is_file_header = line.startswith(("diff ", "Only in", "Index "))
+        if is_file_header:
+            if ".preflight-tmp" in line:
+                skip = True
+                continue
+            skip = False
+        if skip:
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def _write_original_fingerprint(original: Path, dst: Path) -> None:
@@ -298,11 +367,15 @@ class PreflightEnvironment:
         return None
 
     @staticmethod
-    def _block_host_absolute_paths(command: str, sandbox_path: Path) -> list[str]:
+    def _block_host_absolute_paths(command: str, sandbox_path: Path, env: dict | None = None) -> list[str]:
         """Best-effort detection of absolute paths pointing OUTSIDE the copy.
 
         Not a real sandbox (the shell runs on the host), so this guard is an
-        honest safety net, not an impenetrable wall.
+        honest safety net, not an impenetrable wall. Variables are expanded
+        against the child's env FIRST, so ``cat $EMPTY/etc/passwd`` (EMPTY
+        unset -> ``/etc/passwd``) and ``cat $PREFLIGHT_ROOT/victim/original``
+        (a sibling session's record) are judged the way bash will run them,
+        while ``$HOME`` / ``$TMPDIR`` (pinned to the copy) stay inside.
         """
         problems: list[str] = []
         try:
@@ -311,7 +384,8 @@ class PreflightEnvironment:
             # Unbalanced quotes / heredocs: fall back to a regex scan of absolute
             # tokens. Never block on a parse failure.
             tokens = [m.group(0) for m in re.finditer(r"/[^\s'\"`;|&()]*", command)]
-        for tok in tokens:
+        for raw in tokens:
+            tok = _expand_var_tokens(raw, env or {})
             if not tok.startswith("/"):
                 continue
             tok = tok.rstrip("/")
@@ -337,7 +411,7 @@ class PreflightEnvironment:
                 problems.append(tok)
         return problems
 
-    def _block_relative_escape(self, command: str) -> str | None:
+    def _block_relative_escape(self, command: str, env: dict | None = None) -> str | None:
         """Reject path tokens that resolve OUTSIDE the copy (embedded ``..`` included).
 
         Best-effort, like the other guards (the shell runs on the host, so this
@@ -352,14 +426,17 @@ class PreflightEnvironment:
         and are skipped (a bare ``..`` is the single no-slash escape, handled
         explicitly). Absolute tokens are resolved here with the same boundary
         test as ``_block_host_absolute_paths`` so there is no second path in.
+        Variables are expanded against the child's env first (HOME/TMPDIR are
+        pinned inside the copy, so ``$HOME/..`` stays sane).
         """
         try:
             tokens = shlex.split(command)
         except ValueError:
             tokens = [m.group(0) for m in re.finditer(r"\S+", command)]
         cwd = Path(self.sandbox_cwd)
-        for tok in tokens:
-            if tok == ".":
+        for raw in tokens:
+            tok = _expand_var_tokens(raw, env or {})
+            if not tok or tok == ".":
                 continue
             if "/" not in tok:
                 # Only a bare `..` can escape without a path separator (`cd ..`).
@@ -378,14 +455,15 @@ class PreflightEnvironment:
             if not under:
                 return (
                     f"Blocked by preflight: relative path escapes the sandbox "
-                    f"copy ({tok}). Nothing outside the copy is written or read."
+                    f"copy ({tok}). {_HONEST_NOTE}"
                 )
         return None
 
-    def _block_writes_outside(self, command: str):
+    def _block_writes_outside(self, command: str, env: dict | None = None):
         """Reject explicit *writes* (redirection or >) to absolute paths outside the copy."""
         for m in re.finditer(r"[12]?>+\s*('([^']*)'|\"([^\"]*)\"|(\S+))", command):
             target = m.group(2) or m.group(3) or m.group(4) or ""
+            target = _expand_var_tokens(target, env or {})
             if not target.startswith("/"):
                 continue
             try:
@@ -395,7 +473,7 @@ class PreflightEnvironment:
             if not is_under and target != "/dev/null":
                 return (
                     f"Blocked by preflight: write redirection to a path outside the "
-                    f"copy ({target}). Nothing is written outside the sandbox."
+                    f"copy ({target}). {_HONEST_NOTE}"
                 )
         return None
 
@@ -447,6 +525,18 @@ class PreflightEnvironment:
         # HOME ALWAYS points inside the copy: `cd ~`, `~/.bashrc`, git config, etc.
         # never escape to the real user directory, even if the real HOME leaks in.
         env["HOME"] = str(self.sandbox_path)
+        # TMPDIR (and TMP/TEMP if the host env set them) is pinned to a temp
+        # subdir INSIDE the copy too: an innocent `mktemp` or any tool honoring
+        # TMPDIR writes into the copy instead of the host /tmp dir the runtime
+        # may have exported. The dir is created here so it exists before the
+        # child runs. It lives under the copy, so it is excluded from
+        # PENDING.diff and from apply (see _strip_tmpdir and sandboxctl).
+        tmp_dir = self.sandbox_path / ".preflight-tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        env["TMPDIR"] = str(tmp_dir)
+        for var in ("TMP", "TEMP"):
+            if var in env:
+                env[var] = str(tmp_dir)
         # Pass the sandbox ROOT to children (notably `sandboxctl` invoked from inside
         # a command) so they target THIS profile's root. HERMES_HOME is stripped by
         # the sanitizer and HOME is pinned to the copy, so a child would otherwise not
@@ -456,6 +546,11 @@ class PreflightEnvironment:
         return env
 
     def execute(self, command: str, timeout: int | None = None, **kwargs):
+        # Build the filtered environment FIRST: the path guards expand $VAR
+        # against exactly the env the child will receive (HOME/TMPDIR pinned
+        # to the copy), so expansion matches what bash will actually resolve.
+        env = self._make_env()
+
         # 1) Security guards.
         sudo_err = self._reject_sudo(command)
         if sudo_err:
@@ -465,20 +560,20 @@ class PreflightEnvironment:
         if symlink_err:
             return {"output": symlink_err, "exit_code": 1, "returncode": 1}
 
-        write_err = self._block_writes_outside(command)
+        write_err = self._block_writes_outside(command, env)
         if write_err:
             return {"output": write_err, "exit_code": 1, "returncode": 1}
 
-        rel_err = self._block_relative_escape(command)
+        rel_err = self._block_relative_escape(command, env)
         if rel_err:
             return {"output": rel_err, "exit_code": 1, "returncode": 1}
 
-        paths = self._block_host_absolute_paths(command, self.sandbox_path)
+        paths = self._block_host_absolute_paths(command, self.sandbox_path, env)
         if paths:
             return {
                 "output": (
                     "Blocked by preflight: absolute path(s) outside the sandbox "
-                    f"copy: {', '.join(paths)}"
+                    f"copy: {', '.join(paths)}. {_HONEST_NOTE}"
                 ),
                 "exit_code": 1,
                 "returncode": 1,
@@ -486,10 +581,7 @@ class PreflightEnvironment:
 
         effective_timeout = timeout or self.timeout or 120
 
-        # 2) Filtered environment (secrets removed; HOME pinned to the copy).
-        env = self._make_env()
-
-        # 3) Run inside the copy.
+        # 2) Run inside the copy (env was built above).
         try:
             proc = subprocess.run(
                 ["bash", "-c", command],
@@ -550,9 +642,13 @@ class PreflightEnvironment:
         )
         # The diff is the REVIEW VIEW: secret-looking values are redacted here
         # so a cross-session reader (or a `sandboxctl diff`) never sees them in
-        # clear. Apply does NOT read this file for content — it syncs the copy,
-        # so redaction cannot change what is applied.
-        self._pending.write_text(header + _redact_diff_body(body), encoding="utf-8")
+        # clear, and hunks touching the pinned TMPDIR (.preflight-tmp) are
+        # dropped so temp files never pollute the review nor get applied.
+        # Apply does NOT read this file for content — it syncs the copy, so
+        # redaction cannot change what is applied.
+        self._pending.write_text(
+            header + _strip_tmpdir(_redact_diff_body(body)), encoding="utf-8"
+        )
 
     def cleanup(self):
         """Leave the sandbox intact (no delete). Discard is explicit (discard)."""
@@ -577,6 +673,16 @@ class PreflightProvider(TerminalEnvironmentProvider):
         # when unset we fall back to the module default SANDROOT (active Hermes
         # home + /sandbox). Late import so the plugin loads even when the root
         # package is not imported.
+        #
+        # HONEST COMPATIBILITY CONTRACT with bin/sandboxctl: the CLI derives
+        # the DEFAULT root (HERMES_HOME/sandbox or $HOME/.hermes/sandbox) and
+        # cannot derive a per-profile override from the environment. The
+        # backend therefore writes a one-line marker, .preflight-root, INSIDE
+        # the DERIVED root that points to the effective root, and sandboxctl
+        # reads it. Without the marker the CLI uses the derived root. This is a
+        # convenience, not a security boundary: the staging root is writable by
+        # the sandboxed agent (see README 'Honest limitations'), so the marker
+        # is not a secretly-protected value.
         self._sandbox_root = Path(sandbox_root) if sandbox_root else None
 
     def _sandroot(self) -> Path:
@@ -584,6 +690,26 @@ class PreflightProvider(TerminalEnvironmentProvider):
         if self._sandbox_root is not None:
             return self._sandbox_root
         return SANDROOT
+
+    def _sync_root_marker(self) -> None:
+        """Publish the effective root to `sandboxctl` via a .preflight-root marker.
+
+        The marker lives inside the DERIVED root (the one place sandboxctl can
+        always find). It is written when an override is active, and REMOVED when
+        the default root is in use, so the CLI never follows a stale override.
+        Failures are non-fatal: without a marker the CLI falls back to the
+        derived root, which is the documented behavior for the default setup.
+        """
+        marker = SANDROOT / ".preflight-root"
+        try:
+            if self._sandroot() == SANDROOT:
+                if marker.exists():
+                    marker.unlink()
+                return
+            SANDROOT.mkdir(parents=True, exist_ok=True)
+            marker.write_text(str(self._sandroot()), encoding="utf-8")
+        except OSError:
+            pass  # never let marker bookkeeping break session creation
 
     @property
     def description(self):
@@ -629,14 +755,20 @@ class PreflightProvider(TerminalEnvironmentProvider):
         # task_id sanitized (only [a-z0-9_-]) so it cannot leak into paths.
         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(task_id)) or "default"
         sandbox_root = self._sandroot()
+        # Keep bin/sandboxctl in sync with a possible override (point 2).
+        self._sync_root_marker()
         sandbox_dir = sandbox_root / safe_id / "workspace"
         sandbox_dir.mkdir(parents=True, exist_ok=True)
         # Register the original workspace (for sandboxctl apply/discard).
         sandbox_root.joinpath(safe_id, "original").write_text(str(original), encoding="utf-8")
 
         # Reuse a session that already has pending changes instead of re-cloning
-        # and losing its PENDING.diff. Re-clone only after a discard/apply:
-        # (see _clone: it wipes the previous copy for the same task_id).
+        # and losing its PENDING.diff. After a successful apply, PENDING.diff is
+        # emptied and the fingerprint refreshed (see bin/sandboxctl apply), so
+        # the NEXT create_environment with the same task_id re-clones from the
+        # APPLIED state — exactly what makes a second apply legitimate. A
+        # discard removes the whole session dir. _clone wipes the previous copy
+        # for the same task_id.
         pending = sandbox_dir / "PENDING.diff"
         has_pending = False
         try:
@@ -769,4 +901,8 @@ def register(ctx):
             overrides["sandbox_root"] = str(root)
     except Exception:
         pass  # no readable config -> default sandbox root
-    ctx.register_terminal_environment_provider(PreflightProvider(**overrides))
+    provider = PreflightProvider(**overrides)
+    # Publish the effective root marker for sandboxctl (see _sync_root_marker);
+    # without it the CLI falls back to the derived root.
+    provider._sync_root_marker()
+    ctx.register_terminal_environment_provider(provider)

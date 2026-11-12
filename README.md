@@ -9,7 +9,7 @@ a misfired `rm -rf`, a migration or a script never touches your data by accident
 > One-line design: **the agent SEES the copy, EXECUTES on the copy, and APPLIES
 > with your approval.**
 
-Status: `v0.1.0` · plugin `validated` · standalone sandbox test `30/30 passing` ·
+Status: `v0.1.0` · plugin `validated` · standalone sandbox test `36/36 passing` ·
 runs on `linux` and `macos`.
 
 ## Quickstart
@@ -115,6 +115,13 @@ applying.
 - Rejects absolute paths that point **outside** the copy (including a bare `/`).
   Paths are **resolved** before the boundary test, so `/tmp/../etc/passwd`
   cannot dodge it.
+- Shell variables in command tokens are expanded **against the child's env**
+  before the boundary test (the same env that is injected: HOME and TMPDIR are
+  pinned inside the copy). That closes the `$EMPTY/etc/passwd` class of
+  bypasses — an unset variable expands to the empty string, `/etc/passwd` is
+  seen for what it is and blocked. `$HOME/…` and `$TMPDIR/…` resolve inside the
+  copy and keep working normally. Variables defined *inside the command itself*
+  (`X=/etc; cat $X/passwd`) are invisible to this heuristic.
 - Rejects relative paths that **escape** the copy by resolving every path-ish
   token against the copy's cwd — including embedded `..` that does not start
   with a dot, e.g. `a/../../x.txt` or `cat a/../../../etc/passwd`.
@@ -139,8 +146,13 @@ applying.
   `*_URL=`...), URL userinfo and bare secret-looking tokens are masked, so a
   cross-session reader or `sandboxctl diff` never sees credentials in clear.
   Applying is NOT affected — apply syncs the copy, it never reads the diff.
-- `HOME` is pinned **inside the copy**, so `cd ~`, `~/.bashrc`, git config etc.
-  never escape to the real user directory.
+- `HOME` and `TMPDIR` (plus `TMP`/`TEMP` when picked up from the host env) are
+  pinned **inside the copy**: `cd ~`, `~/.bashrc`, git config, `mktemp` and any
+  tool honoring `$TMPDIR` never escape to the real user directory or the host
+  `/tmp`. The pinned temp dir is `<copy>/.preflight-tmp`, created with the
+  environment; because it lives in the copy it is excluded from `PENDING.diff`
+  and from `apply` (`rsync --exclude=.preflight-tmp`), so temp files never
+  pollute the review nor get written to the real workspace.
 - `skip_container_guards = False`: the model still goes through Hermes' approval
   guards.
 - Pattern matching can reject benign commands that merely contain the word
@@ -148,7 +160,9 @@ applying.
   bug.
 
 > These guards are **heuristics, not a kernel sandbox**. The command *does have
-> network access* and runs as a host process. See "What it doesn't do" below.
+> network access* and runs as a host process. Every guard message says so
+> explicitly and points here; the plugin never claims the host is unreachable
+> from the copy. See "Honest limitations" below.
 
 ## When NOT to use preflight
 
@@ -162,6 +176,34 @@ applying.
 
 ## Honest limitations
 
+The guards scan **literal command strings only**. These concrete blind spots
+are by name, not in the abstract:
+
+- **Variable expansion can still touch the host.** `$HOME` and `$TMPDIR` are
+  pinned inside the copy, but a host variable that reaches the child and is
+  used in a path is expanded by bash after the string scan. Examples that can
+  still read/write the host: an unset variable that concatenates an absolute
+  path inside the command (`X=/etc; cat $X/passwd`), variables defined
+  elsewhere in the same command line, and a host `$TMPDIR`/`$TMP`/`$TEMP`
+  value when it predates the pin (the pin replaces the value the child sees,
+  but the *string* `$TMPDIR` in a command is only judged after expansion).
+- **Invoked scripts can still touch the host.** The guards see `bash
+  script.sh`, not the script's contents: a script that contains `cat
+  /etc/passwd` or `echo x > $HOME/out` runs on the host. Same for `python3 -c
+  "..."`, `python -`, `. file.sh`, `source`, `curl | sh`, or any subprocess
+  that executes code from inside a file. The line of command is scanned; the
+  file it runs is not.
+- **The staging root is NOT a trust boundary.** Sandboxes of different
+  sessions live under one root (`<derived or override root>/<id>/…`), and the
+  sandboxed agent receives `$PREFLIGHT_ROOT` pointing at that root. From
+  inside a copy an agent can therefore **read or overwrite another session's
+  registration record** (e.g. `$PREFLIGHT_ROOT/victim/original`) and the
+  fingerprint file (`$PREFLIGHT_ROOT/victim/original.fingerprint`, which is
+  writable). The guards block the obvious literal/expanded forms, but the
+  staging area is a shared workspace, not a fortress: the real protection is
+  the **human TTY confirmation on `apply`/`discard`** (best-effort, as stated)
+  plus the fact that a tampered session still cannot change *your* decision to
+  apply it or not.
 - **The copy is not a boundary against the agent**: a relative `../` path can
   reach outside it (the guards resolve paths against the copy's cwd and reject
   the obvious escapes, but a determined command string can still evade — the
@@ -184,16 +226,32 @@ applying.
   slower on big workspaces, equally safe.
 - Different `task_id` means a different copy: changes are not shared between
   sessions.
+- After a successful `apply`, the session is left clean: `PENDING.diff` is
+  emptied and the integrity fingerprint is refreshed, so reusing the same
+  `task_id` legitimately starts a fresh review (the next `create_environment`
+  re-clones from the applied state). Applying again without new changes will
+  simply report no pending changes instead of a stale "CHANGED"; apply without
+  a fresh review still refuses if another real change happened meanwhile.
 - The raw diff includes absolute path names; in a git repo you may want to
   review `PENDING.diff` against the repo.
 
 ## Multiple profiles
 
 Every profile gets its own sandbox namespace (the backend derives the root
-from the **active** Hermes home + `/sandbox`, or from a per-profile
-`sandbox_root` plugin-config key). `sandboxctl` mirrors that derivation, and
-its destructive commands (`apply` / `discard`) refuse a `PREFLIGHT_ROOT` that
-does not match the root derived from `HERMES_HOME`.
+from the **active** Hermes home + `/sandbox`, or honors a per-profile
+`sandbox_root` plugin-config key). `sandboxctl` derives the default root the
+same way, and its destructive commands (`apply` / `discard`) refuse a
+`PREFLIGHT_ROOT` that does not match the effective root.
+
+**`sandbox_root` override + `sandboxctl`:** the CLI cannot derive a
+per-profile override from the environment, so it does **not** claim to mirror
+it. The backend writes the effective root to a one-line marker,
+`<derived root>/.preflight-root`, and `sandboxctl` reads that marker: with the
+marker present, status/apply/discard target the overridden root; without it
+(no session created by the backend yet, or a default setup), the CLI uses the
+derived root. The marker is a convenience so the CLI can honor the override —
+it is **not** a trust boundary and does not bootstrap a second way to bypass
+the TTY confirmation.
 
 To target a *specific* profile's sessions from a shell that is not running
 that profile, export its Hermes home first:
@@ -204,8 +262,8 @@ sandboxctl status
 ```
 
 `PREFLIGHT_ROOT` is transport-only: the backend sets it for child scripts, and
-it must equal the derived root, so a sandboxed command cannot aim `discard` at
-another profile's sessions.
+it must equal the effective root (marker or derived), so a sandboxed command
+cannot aim `discard` at another profile's sessions.
 
 ## Files
 
@@ -223,7 +281,7 @@ another profile's sessions.
 ## Quick verification
 
 ```bash
-python3 tests/_test_sandbox.py   # must end with: TODO PASS ✔ (30 PASS)
+python3 tests/_test_sandbox.py   # must end with: TODO PASS ✔ (36 PASS)
 python3 tests/_probe_leak.py     # must end with: TODO OK: sin fugas
 python3 tests/_poc_evidence.py   # demos the audited PoCs are mitigated
 hermes plugins validate ~/.hermes/plugins/preflight   # Validation passed, security scan safe

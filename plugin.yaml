@@ -1,6 +1,6 @@
 name: preflight
 version: 0.1.0
-description: "Preflight dry-run gate: runs each command in a throwaway workspace copy (isolated), shows the exact diff, and applies only what you explicitly approve."
+description: "Preflight dry-run gate: runs each command in a throwaway workspace copy, shows the exact diff, and applies only what you explicitly approve. The copy is not a kernel sandbox - see README 'Honest limitations'."
 requires_hermes: ">=0.22.0"
 kind: backend
 # Plugin config keys (set under plugins.entries.<id>.settings in config.yaml):
@@ -10,8 +10,16 @@ kind: backend
 #     + /sandbox, so every profile gets its own sandbox namespace. The legacy
 #     PREFLIGHT_ROOT / SANDBOX_FIRST_ROOT environment variables are no longer
 #     read by the backend — use this key instead.
+#
+#     COMPATIBILITY NOTE (sandboxctl): this override is NOT derived from the
+#     environment by the CLI. The backend writes the effective root into a
+#     one-line marker at <derived root>/.preflight-root; sandboxctl reads that
+#     marker and targets the override. If the marker is absent (e.g. no session
+#     created by the backend yet), sandboxctl operates on the DERIVED root —
+#     use the backend/API for the override, or create a session first so the
+#     marker exists. The marker is a convenience, not a security boundary.
 config_schema:
   sandbox_root:
     type: string
     required: false
-    description: "Optional per-profile sandbox root override. Defaults to the active Hermes home + /sandbox."
+    description: "Optional per-profile sandbox root override. Defaults to the active Hermes home + /sandbox. sandboxctl targets it via the .preflight-root marker the backend writes under the derived root; without the marker, sandboxctl uses the derived root."

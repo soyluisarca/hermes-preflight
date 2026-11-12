@@ -128,12 +128,74 @@ def _partial_str(data) -> str:
     return str(data)
 
 
+# --- PENDING.diff redaction (review view only; apply never reads the diff) ---
+# A variable NAME whose name ENDS with one of these tokens is treated as a
+# secret and its assigned value is redacted in the review view. Suffix
+# matching (case-insensitive) covers TOKEN, *_KEY, *_SECRET, *_PASSWORD,
+# *_PASS, *_PWD, *_CREDENTIAL, *_URL and the official names (PGPASSWORD,
+# RCLONE_CONFIG_PASS, ...) without false-matching an embedded word
+# (CURL_OPTIONS does not end in URL, TOKENIZER does not end in TOKEN).
+_SENSITIVE_NAME_SUFFIXES = (
+    "TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD", "PWD", "CREDENTIAL",
+    "PRIVATE", "ACCESS_KEY", "PASS", "URL",
+)
+# ``NAME  =  value`` at the start of a diff line (after the +/-/space marker);
+# optional `export ` prefix covers shell exports.
+_SENSITIVE_ASSIGN_RE = re.compile(
+    r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|:)\s*(.*)$",
+    re.IGNORECASE,
+)
+# userinfo in URLs: https://user:pass@host -> https://<redacted>@host
+_URL_USERINFO_RE = re.compile(r"(https?://)[^/\s:@\"]+@")
+# Standalone secret-looking values (sk-.../ghp_.../AKIA.../JWT) on their own.
+_SECRET_VALUE_RE = re.compile(
+    r"(\b(?:sk-|ghp_|gho_|xox[bap]-|AKIA|eyJ)[A-Za-z0-9_\-\.]{8,}\b)"
+)
+
+
+def _name_looks_sensitive(name: str) -> bool:
+    upper = name.upper()
+    return any(upper.endswith(s) for s in _SENSITIVE_NAME_SUFFIXES)
+
+
+def _redact_diff_body(body: str) -> str:
+    """Return a copy of a raw diff body with secret-looking values redacted.
+
+    Every line is scanned independently: if a ``NAME=value``/``NAME: value``
+    pair has a secret-smelling name, the value is replaced; URLs with embedded
+    userinfo get the userinfo removed; bare secret tokens are masked. Lines
+    that do not match keep their exact content.
+    """
+    out = []
+    for line in body.splitlines():
+        out.append(_redact_sensitive_line(line))
+    return "\n".join(out)
+
+
+def _redact_sensitive_line(line: str) -> str:
+    stripped = line.lstrip("+- ")
+    m = _SENSITIVE_ASSIGN_RE.match(stripped)
+    if m and _name_looks_sensitive(m.group(1)) and m.group(2).strip():
+        prefix_len = len(line) - len(stripped)
+        return line[:prefix_len] + f"{m.group(1)} = <redacted>"
+    red = _URL_USERINFO_RE.sub(lambda mm: mm.group(1) + "<redacted>@", line)
+    if red != line:
+        return red
+    if _SECRET_VALUE_RE.search(line):
+        return _SECRET_VALUE_RE.sub("<redacted>", line)
+    return line
+
+
 def _write_original_fingerprint(original: Path, dst: Path) -> None:
     """Snapshot of the real workspace at clone time.
 
     ``sandboxctl apply`` recomputes this and aborts if it changed since the
     clone (TOCTOU guard): a file created or edited in the real workspace AFTER
     the clone must never be silently clobbered by an apply.
+
+    Each line carries ``path<TAB>mtime_ns<TAB>size<TAB>sha256<TAB>kind``. The
+    content hash makes the guard hold even when an attacker edits a file and
+    preserves mtime+size (a real change always changes the sha256).
     """
     lines: list[str] = []
     for root, dirs, files in os.walk(original):
@@ -486,7 +548,11 @@ class PreflightEnvironment:
             f"# To apply: sandboxctl apply {self.sandbox_path.name}\n"
             f"# To discard: sandboxctl discard {self.sandbox_path.name}\n\n"
         )
-        self._pending.write_text(header + body, encoding="utf-8")
+        # The diff is the REVIEW VIEW: secret-looking values are redacted here
+        # so a cross-session reader (or a `sandboxctl diff`) never sees them in
+        # clear. Apply does NOT read this file for content — it syncs the copy,
+        # so redaction cannot change what is applied.
+        self._pending.write_text(header + _redact_diff_body(body), encoding="utf-8")
 
     def cleanup(self):
         """Leave the sandbox intact (no delete). Discard is explicit (discard)."""

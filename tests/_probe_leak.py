@@ -10,8 +10,11 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 REPO = Path(os.environ.get("HERMES_AGENT_REPO", str(Path.home() / ".hermes" / "hermes-agent")))
 sys.path.insert(0, str(REPO))
 
-os.environ["PREFLIGHT_ROOT"] = tempfile.mkdtemp(prefix="sbx-leak-")
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="sbx-leak-home-")
+# Backend derives the sandbox root from get_hermes_home() + /sandbox; PREFLIGHT_ROOT
+# is no longer read (config key replaces env overrides), so only HERMES_HOME isolates.
+os.environ.pop("PREFLIGHT_ROOT", None)
+os.environ.pop("SANDBOX_FIRST_ROOT", None)
 
 # Simular credenciales en el entorno real.
 os.environ["FAL_KEY"] = "leak"

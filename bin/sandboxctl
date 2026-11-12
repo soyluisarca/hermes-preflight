@@ -1,66 +1,121 @@
 #!/usr/bin/env bash
-# sandboxctl — control de sesiones preflight.
-# Uso: sandboxctl <status|diff|apply|discard> [task_id] [--yes]
+# sandboxctl — preflight session control.
+# Usage: sandboxctl <status|diff|apply|discard> [task_id] [--yes]
 #
-# apply    : aplica SOLO los archivos que cambió el sandbox (diff exacto) y hace
-#            los borrados EXPLÍCITOS, nunca con --delete global. Antes verifica
-#            (fingerprint) que el workspace real NO cambió desde el clon (TOCTOU).
-# discard  : borra la copia. El workspace real no se toca.
-# status   : lista sesiones existentes y su PENDING.diff.
-# diff     : imprime el PENDING.diff de una sesión.
+# apply    : syncs the sandbox copy INTO the real workspace (whole-workspace,
+#            no per-file selection) and applies explicit deletions, NEVER a
+#            global --delete. First verifies (fingerprint) that the real
+#            workspace did not change since the clone (TOCTOU). Requires
+#            confirmation: --yes is honored ONLY when stdin is a terminal.
+# discard  : removes the copy. The real workspace is not touched.
+# status   : lists existing sessions and their PENDING.diff.
+# diff     : prints a session's PENDING.diff.
 set -euo pipefail
+shopt -s nullglob
 
-# PREFLIGHT_ROOT es la variable canónica; SANDBOX_FIRST_ROOT se conserva como
-# fallback para no romper sesiones/configs/tests antiguos.
-: "${PREFLIGHT_ROOT:=${SANDBOX_FIRST_ROOT:-${HOME}/.hermes/sandbox}}"
+# The sandbox root must match the backend's active Hermes home (each profile
+# gets its own namespace). The backend derives it from the active Hermes home
+# + /sandbox (and honors a per-profile plugin config key "sandbox_root"); this
+# script mirrors that. PREFLIGHT_ROOT is accepted as an explicit override for
+# scripts/tests but is NOT read by the backend anymore.
+if [[ -n "${PREFLIGHT_ROOT:-}" ]]; then
+  ROOT="$PREFLIGHT_ROOT"
+else
+  HERMES_HOME="${HERMES_HOME:-}"
+  if [[ -z "$HERMES_HOME" ]]; then
+    HERMES_HOME="$HOME/.hermes"
+  fi
+  ROOT="$HERMES_HOME/sandbox"
+fi
 
 cmd="${1:-status}"
 task_id="${2:-}"
-assume_yes=0
-for a in "$@"; do [[ "$a" == "--yes" || "$a" == "-y" ]] && assume_yes=1; done
+
+# --yes is honored ONLY on an interactive terminal. An agent driving a
+# subprocess (stdin not a TTY) must NEVER be able to self-approve an apply.
+have_yes=0
+for a in "$@"; do [[ "$a" == "--yes" || "$a" == "-y" ]] && have_yes=1; done
+if [[ "$have_yes" -eq 1 && ! -t 0 ]]; then
+  echo "✖ --yes is only honored on an interactive terminal. An agent cannot self-approve an apply; run it yourself." >&2
+  exit 2
+fi
 
 if [[ "$cmd" == "status" ]]; then
-  echo "=== preflight: sesiones ==="
-  if [[ ! -d "$PREFLIGHT_ROOT" ]]; then
-    echo "  (no hay sesiones en $PREFLIGHT_ROOT)"
+  echo "=== preflight: sessions (root: $ROOT) ==="
+  if [[ ! -d "$ROOT" ]]; then
+    echo "  (no sessions under $ROOT)"
     exit 0
   fi
-  for ws in "$PREFLIGHT_ROOT"/*/workspace; do
+  for ws in "$ROOT"/*/workspace; do
     [[ -d "$ws" ]] || continue
     id="$(basename "$(dirname "$ws")")"
     pending=0
     if [[ -f "$ws/PENDING.diff" ]]; then
-      # líneas de diff reales (empezando por + / - / diff / Only / Index)
+      # real diff lines (starting with + / - / diff / Only / Index)
       pending="$(grep -cE '^[+-]|^diff |^Only |^Index ' "$ws/PENDING.diff" || true)"
     fi
-    echo "  $id  (cambios pendientes: $pending)"
+    echo "  $id  (pending changes: $pending)"
   done
   exit 0
 fi
 
-[[ -n "$task_id" ]] || { echo "uso: sandboxctl $cmd <task_id>"; exit 2; }
-WS="$PREFLIGHT_ROOT/$task_id/workspace"
-[[ -d "$WS" ]] || { echo "sesión no encontrada: $task_id"; exit 1; }
+[[ -n "$task_id" ]] || { echo "usage: sandboxctl $cmd <task_id>"; exit 2; }
+WS="$ROOT/$task_id/workspace"
+ORIGIN_FILE="$ROOT/$task_id/original"
 
-ORIGIN_FILE="$PREFLIGHT_ROOT/$task_id/original"
-[[ -f "$ORIGIN_FILE" ]] || { echo "falta el registro del workspace original de $task_id"; exit 1; }
+# The copy and the original registration must both be INSIDE the sandbox root.
+# A relative/absolute path that resolves outside it (e.g. a crafted registration
+# with ../ components) would let apply reach the real host — block it here.
+_resolve_under_root() {
+  # usage: _resolve_under_root <path> -> echoes the canonical path or exits.
+  local p="$1"
+  if [[ "$p" != /* ]]; then
+    p="$ROOT/$p"
+  fi
+  # Reject any . or .. component (must stay strictly under ROOT).
+  if [[ "$p" =~ (^|/)\.\.?(/|$) ]]; then
+    echo "✖ refusing path with .. or . components: $p" >&2
+    exit 1
+  fi
+  # Also reject symlinks: make sure the canonical real path stays under ROOT.
+  local canon
+  canon="$(realpath -m "$p" 2>/dev/null || echo "$p")"
+  case "$canon" in
+    "$ROOT"/*) echo "$canon" ;;
+    *) echo "✖ refusing path outside the sandbox root: $canon" >&2; exit 1 ;;
+  esac
+}
+
+# Task id that would escape the root (e.g. a crafted ../task_id) must fail.
+case "$ROOT/$task_id" in
+  *'/../'*|*'/./'*|*"../"*|*"./"*) echo "✖ refusing task id escaping the sandbox root: $task_id" >&2; exit 1 ;;
+esac
+WS="$(_resolve_under_root "$WS")" || exit 1
+[[ -d "$WS" ]] || { echo "session not found: $task_id"; exit 1; }
+
+[[ -f "$ORIGIN_FILE" ]] || { echo "missing original-workspace record for $task_id"; exit 1; }
 ORIG="$(cat "$ORIGIN_FILE")"
-[[ -d "$ORIG" ]] || { echo "workspace original inválido: $ORIG"; exit 1; }
+[[ "$ORIG" = /* ]] || { echo "invalid original workspace: $ORIG"; exit 1; }
+[[ -d "$ORIG" ]] || { echo "invalid original workspace: $ORIG"; exit 1; }
+# Never apply back onto the copy itself, and never onto the sandbox staging dir.
+case "$(realpath -m "$ORIG")" in
+  "$ROOT"/*) echo "✖ refusing to apply onto a path inside the sandbox root: $ORIG" >&2; exit 1 ;;
+esac
 
-# Fingerprint del workspace real en el momento del clon (TOCTOU guard).
-FP="$PREFLIGHT_ROOT/$task_id/original.fingerprint"
+# Fingerprint of the real workspace at clone time (TOCTOU guard).
+FP="$ROOT/$task_id/original.fingerprint"
 
 case "$cmd" in
   diff)
-    [[ -f "$WS/PENDING.diff" ]] && cat "$WS/PENDING.diff" || echo "(sin PENDING.diff)"
+    [[ -f "$WS/PENDING.diff" ]] && cat "$WS/PENDING.diff" || echo "(no PENDING.diff)"
     ;;
 
   apply)
-    # 0) TOCTOU: el workspace real no debe haber cambiado desde el clon.
-    #    Sin fingerprint no podemos garantizarlo -> no aplicar.
+    # 0) TOCTOU: the real workspace must not have changed since the clone.
+    #    Without a fingerprint we cannot guarantee it -> do not apply.
     if [[ ! -f "$FP" ]]; then
-      echo "✖ Sesión creada sin fingerprint de integridad; no puedo garantizar que el workspace real no cambió." >&2
-      echo "  Descártala y recréala para aplicar con seguridad:" >&2
+      echo "✖ Session created without an integrity fingerprint; cannot guarantee the real workspace did not change." >&2
+      echo "  Discard it and recreate to apply safely:" >&2
       echo "    sandboxctl discard $task_id" >&2
       exit 1
     fi
@@ -90,39 +145,46 @@ print("\n".join(sorted(lines)))
 PYEOF
 )"
     if [[ "$current_fp" != "$(cat "$FP")" ]]; then
-      echo "✖ El workspace real CAMBIÓ desde que se clonó la copia. Re-sincroniza:" >&2
+      echo "✖ The real workspace CHANGED since the copy was cloned. Re-sync:" >&2
       echo "    sandboxctl discard $task_id" >&2
-      echo "  y deja al agente crear una sesión nueva. Si aplicas ahora pisarías el cambio real." >&2
+      echo "  and let the agent create a new session. Applying now would clobber the real change." >&2
       exit 1
     fi
 
-    echo "▶ Aplicando cambios de '$task_id' al workspace real..."
-    echo "  origen : $WS"
-    echo "  destino: $ORIG"
-    echo "  (estado del diff)"
+    echo "▶ Applying changes of '$task_id' to the real workspace..." 
+    echo "  source : $WS"
+    echo "  target : $ORIG"
+    echo "  (diff state)"
     [[ -f "$WS/PENDING.diff" ]] && grep -E '^[+-]|^diff |^Only |^Index ' "$WS/PENDING.diff" | head -n 60 || true
     echo
-    if [[ "$assume_yes" -eq 1 ]]; then
+    if [[ "$have_yes" -eq 1 ]]; then
+      # --yes was verified to run on an interactive terminal at the top of the
+      # script, so a human explicitly approved this apply.
       ans=s
-    elif [[ ! -t 0 ]]; then
-      echo "✖ apply necesita confirmación: corre con --yes (o desde una terminal interactiva)." >&2
-      exit 2
+    elif [[ -t 0 ]]; then
+      read -r -p "Apply? this OVERWRITES the real workspace [y/N]: " ans
     else
-      read -r -p "¿Aplicar? esto SOBREESCRIBE el workspace real [s/N]: " ans
+      echo "✖ apply requires interactive confirmation; an agent cannot self-approve an apply." >&2
+      exit 2
     fi
 
     if [[ "$ans" =~ ^[sSyY]$ ]]; then
-      # 1) contenido nuevo/modificado: rsync SIN --delete. Ningún archivo del
-      #    workspace real se borra aquí (un archivo creado en el real tras el
-      #    clon sobrevive; el fingerprint de arriba ya garantiza que no pasó).
+      # 1) new/modified content: rsync WITHOUT --delete. No file is removed from
+      #    the real workspace here (a file created after the clone survives; the
+      #    fingerprint above already guarantees none appeared).
       rsync -a --exclude=PENDING.diff "$WS/" "$ORIG/"
-      # 2) borrados EXPLÍCITOS: solo los paths que el sandbox eliminó (presentes
-      #    en ORIG, ausentes en WS). Nunca --delete global. Con el fingerprint OK
-      #    no hay archivos creados por el usuario tras el clon, así que el
-      #    conjunto es exacto; el `! -e "$WS/$d"` es una red extra.
+      # 2) explicit deletions: only the paths the sandbox removed (present in
+      #    ORIG, absent in WS). Never a global --delete. With a valid fingerprint
+      #    no user file appeared after the clone, so the set is exact; the
+      #    `! -e "$WS/$d"` guard is a second net.
       while IFS= read -r d; do
         [[ -n "$d" ]] || continue
         target="$ORIG/$d"
+        # Never let a crafted deletion path escape the original workspace.
+        if [[ "$target" != "$ORIG"/* ]]; then
+          echo "✖ refusing deletion outside the workspace: $target" >&2
+          exit 1
+        fi
         if [[ ! -e "$WS/$d" ]]; then
           if [[ -d "$target" && ! -L "$target" ]]; then
             rm -rf -- "$target"
@@ -132,20 +194,20 @@ PYEOF
         fi
       done < <(rsync -av --delete --dry-run --exclude=PENDING.diff "$WS/" "$ORIG/" 2>/dev/null \
                 | grep '^deleting ' | sed 's/^deleting //' || true)
-      echo "✔ Aplicado."
+      echo "✔ Applied."
     else
-      echo "✖ Aplicación cancelada."
+      echo "✖ Apply cancelled."
       exit 1
     fi
     ;;
 
   discard)
-    rm -rf -- "$PREFLIGHT_ROOT/$task_id"
-    echo "✔ Sesión '$task_id' descartada (el workspace real no se tocó)."
+    rm -rf -- "$ROOT/$task_id"
+    echo "✔ Session '$task_id' discarded (the real workspace was not touched)."
     ;;
 
   *)
-    echo "comando desconocido: $cmd (status|diff|apply|discard)"
+    echo "unknown command: $cmd (status|diff|apply|discard)"
     exit 2
     ;;
 esac

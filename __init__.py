@@ -64,14 +64,23 @@ _STRIP_ENV_PREFIX = (
     "MESHY_", "SUPABASE_", "LANGSMITH_", "ELEVENLABS_", "DEEPSEEK_", "GLM_",
     "PORTAL_", "HERMES_",
 )
-# Sensitive suffixes stripped, again case-insensitive.
+# Sensitive suffixes stripped, again case-insensitive. Covers the usual
+# provider naming patterns: *_API_KEY / *_TOKEN / *_SECRET / *_PASSWORD /
+# *_CREDENTIAL / *_ACCESS_KEY plus the audit findings: *_PASS, *_PWD, *_KEY
+# (catches *_SECRET_KEY and *_PRIVATE_KEY too) and *_URL (DATABASE_URL,
+# REDIS_URL, ...).
 _STRIP_ENV_SUFFIX = (
     "_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIAL", "_ACCESS_KEY",
+    "_PASS", "_PWD", "_KEY", "_URL",
 )
-# Exact names always dropped (case-insensitive), e.g. git/registry/ssh creds.
+# Exact names always dropped (case-insensitive), e.g. git/registry/ssh creds
+# and the canonical database/daemon password variables that do not carry a
+# _SUFFIX (PGPASSWORD has no underscore before PASSWORD, MYSQL_PWD and
+# RCLONE_CONFIG_PASS are also listed for belt-and-braces).
 _STRIP_ENV_EXACT = frozenset({
     "SSH_AUTH_SOCK", "GOOGLE_APPLICATION_CREDENTIALS", "NPM_TOKEN", "GH_TOKEN",
-    "GITHUB_TOKEN", "HF_TOKEN", "NETRC",
+    "GITHUB_TOKEN", "HF_TOKEN", "NETRC", "PGPASSWORD", "MYSQL_PWD",
+    "RCLONE_CONFIG_PASS",
 })
 # Variables that must be PRESERVED by the sanitizer are not credentials, so the
 # filter lets them through naturally (PATH, HOME, LANG, TERM match no prefix,

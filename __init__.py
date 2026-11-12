@@ -226,8 +226,15 @@ class PreflightEnvironment:
             # /tmp inside the copy and the copy itself are allowed; everything else is flagged.
             if tok == str(sandbox_path):
                 continue
+            # Resolve the token first (normalizes `..` segments and follows
+            # symlinks inside the path) so `/tmp/../etc/passwd` cannot dodge
+            # the literal-prefix test.
             try:
-                is_under = os.path.commonpath([sandbox_path, tok]) == str(sandbox_path)
+                cand = Path(tok).resolve(strict=False)
+            except Exception:
+                cand = Path(tok)
+            try:
+                is_under = os.path.commonpath([str(sandbox_path), str(cand)]) == str(sandbox_path)
             except Exception:
                 is_under = False
             if not is_under and not tok.startswith("/dev/null"):
@@ -235,14 +242,20 @@ class PreflightEnvironment:
         return problems
 
     def _block_relative_escape(self, command: str) -> str | None:
-        """Reject relative path tokens that walk OUT of the copy via ``..``.
+        """Reject path tokens that resolve OUTSIDE the copy (embedded ``..`` included).
 
         Best-effort, like the other guards (the shell runs on the host, so this
-        is a safety net, not a wall). An absolute path is handled by
-        ``_block_host_absolute_paths``; this catches ``..``-style traversal that
-        resolves outside the sandbox copy relative to the copy's cwd. ``..``
-        segments that stay inside the copy (e.g. ``../peer`` where ``peer`` is
-        a sibling inside the workspace) are allowed.
+        is a safety net, not a wall). Every path-ish token — any token that
+        contains a ``/``, plus a bare ``..`` — is resolved against the copy's
+        cwd: if the resolved candidate leaves the cwd, the token is blocked.
+        This catches foreign-``..`` traversal such as ``a/../../x.txt`` (the
+        token does not start with ``.`` but still escapes) and ``cat
+        a/../../../etc/passwd``. ``..`` segments that stay inside the copy
+        (e.g. ``../peer`` where ``peer`` is a sibling inside the workspace) are
+        allowed. Tokens without a path separator cannot escape by resolution
+        and are skipped (a bare ``..`` is the single no-slash escape, handled
+        explicitly). Absolute tokens are resolved here with the same boundary
+        test as ``_block_host_absolute_paths`` so there is no second path in.
         """
         try:
             tokens = shlex.split(command)
@@ -250,18 +263,19 @@ class PreflightEnvironment:
             tokens = [m.group(0) for m in re.finditer(r"\S+", command)]
         cwd = Path(self.sandbox_cwd)
         for tok in tokens:
-            if not tok.startswith("."):
+            if tok == ".":
                 continue
-            # Only care about path-ish tokens (not e.g. `test -x ..` discussions,
-            # but erring toward blocking is fine for a command-substitution risk).
-            if tok in (".", ".."):
-                candidate = cwd / tok
-            elif tok.startswith("./") or tok.startswith("../"):
-                candidate = cwd / tok
+            if "/" not in tok:
+                # Only a bare `..` can escape without a path separator (`cd ..`).
+                if tok != "..":
+                    continue
+                cand = cwd / tok
+            elif tok.startswith("/"):
+                cand = Path(tok)
             else:
-                continue
+                cand = cwd / tok
             try:
-                resolved = candidate.resolve(strict=False)
+                resolved = cand.resolve(strict=False)
                 under = os.path.commonpath([str(resolved), str(cwd)]) == str(cwd)
             except Exception:
                 under = False
@@ -270,8 +284,6 @@ class PreflightEnvironment:
                     f"Blocked by preflight: relative path escapes the sandbox "
                     f"copy ({tok}). Nothing outside the copy is written or read."
                 )
-        # Also flag explicit `..` traversals to the root of any drive iff they
-        # would escape; handled above. Nothing more to scan.
         return None
 
     def _block_writes_outside(self, command: str):
@@ -510,7 +522,10 @@ class PreflightProvider(TerminalEnvironmentProvider):
         # must never be the source of a sandbox copy). Cloning the home directory
         # copies it over itself, walks the whole tree via the copytree fallback
         # (filling the disk) and snapshots every secret under ~ into the copy.
-        self._reject_forbidden_original(original)
+        # Returns the CANONICAL (resolved) path; clone, registration and the
+        # fingerprint all use it so a symlinked or `..`-aliased original cannot
+        # dodge the TOCTOU boundary.
+        original = self._reject_forbidden_original(original)
         # task_id sanitized (only [a-z0-9_-]) so it cannot leak into paths.
         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(task_id)) or "default"
         sandbox_root = self._sandroot()
@@ -541,14 +556,17 @@ class PreflightProvider(TerminalEnvironmentProvider):
             cwd=cwd, timeout=timeout, sandbox_path=sandbox_dir, original_path=original
         )
 
-    def _reject_forbidden_original(self, original: Path) -> None:
-        """Refuse to clone the user's home or Hermes home, or a path that
-        contains the sandbox root.
+    def _reject_forbidden_original(self, original: Path) -> Path:
+        """Refuse to clone the user's home / Hermes home, sensitive dirs, or a
+        path that contains the sandbox root; return the canonical resolved path.
 
         ``cp -a ~/.hermes/sandbox/... ~/`` would copy the copy onto itself,
         the copytree fallback recurses until the disk fills, and every secret
-        under ``~`` gets snapshotted into the copy. Raise a clear error asking
-        the user to ``cd`` into a project directory instead.
+        under ``~`` gets snapshotted into the copy. The same reasoning applies
+        to credential stores under the home (~/.ssh, ~/.aws, ~/.gnupg) and to
+        system directories (/etc, /var): cloning them snapshots secrets or
+        explodes the tree. Raise a clear error asking the user to ``cd`` into a
+        project directory instead.
         """
         try:
             orig_res = original.resolve()
@@ -572,6 +590,9 @@ class PreflightProvider(TerminalEnvironmentProvider):
             except Exception:
                 return False
 
+        sensitive_home = [home / d for d in (".ssh", ".aws", ".gnupg")]
+        system_roots = [Path("/etc"), Path("/var")]
+
         bad = False
         reason = ""
         if orig_res == home:
@@ -580,6 +601,12 @@ class PreflightProvider(TerminalEnvironmentProvider):
         elif any(orig_res == h for h in hermes_homes):
             bad = True
             reason = f"refusing to clone the Hermes home directory ({orig_res})"
+        elif any(orig_res == s or under(orig_res, s) for s in sensitive_home):
+            bad = True
+            reason = f"refusing to clone a sensitive directory under your home ({orig_res})"
+        elif any(orig_res == s or under(orig_res, s) for s in system_roots):
+            bad = True
+            reason = f"refusing to clone a system directory ({orig_res})"
         elif sand_root and (under(orig_res, sand_root) or under(sand_root, orig_res)):
             bad = True
             reason = (
@@ -592,6 +619,7 @@ class PreflightProvider(TerminalEnvironmentProvider):
                 f"and snapshot every secret under it. cd into a project directory "
                 f"first, then run the command there."
             )
+        return orig_res
 
     @staticmethod
     def _clone(src: Path, dst: Path):

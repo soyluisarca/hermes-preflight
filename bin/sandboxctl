@@ -1,42 +1,86 @@
 #!/usr/bin/env bash
 # sandboxctl — preflight session control.
 # Usage: sandboxctl <status|diff|apply|discard> [task_id] [--yes]
+# Run `sandboxctl --help` for the full usage and security notes.
 #
 # apply    : syncs the sandbox copy INTO the real workspace (whole-workspace,
 #            no per-file selection) and applies explicit deletions, NEVER a
 #            global --delete. First verifies (fingerprint) that the real
-#            workspace did not change since the clone (TOCTOU). Requires
+#            workspace did not change since the clone (TOCTOU) and that the
+#            copy contains no symlink escaping the sandbox root. Requires
 #            confirmation: --yes is honored ONLY when stdin is a terminal.
-# discard  : removes the copy. The real workspace is not touched.
+# discard  : removes the copy. The real workspace is not touched. Requires
+#            the same interactive confirmation as apply.
 # status   : lists existing sessions and their PENDING.diff.
 # diff     : prints a session's PENDING.diff.
 set -euo pipefail
 shopt -s nullglob
 
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+sandboxctl — preflight session control.
+
+Usage:
+  sandboxctl status                     list sessions under the sandbox root
+  sandboxctl diff   <task_id>           print the session's PENDING.diff
+  sandboxctl apply  <task_id> [--yes]   sync the copy into the real workspace
+  sandboxctl discard <task_id> [--yes]  remove the copy (real workspace untouched)
+
+Security notes (read carefully):
+  * apply and discard require interactive confirmation. --yes is honored ONLY
+    when stdin is a real terminal. This is a BEST-EFFORT guard: a determined
+    agent that allocates a pty (python3 -c "import pty", script, ssh -tt ...)
+    can self-approve. It stops accidental non-TTY approvals, not a determined
+    local agent.
+  * The sandbox root is derived from the Hermes home. With multiple profiles,
+    export HERMES_HOME=<that profile's hermes home> so this command targets
+    THAT profile's sessions, e.g.:
+        export HERMES_HOME=~/.hermes/profiles/<profile>
+    PREFLIGHT_ROOT is transport-only (set by the backend for child scripts)
+    and MUST match the derived root; a mismatched value is refused.
+  * apply is WHOLE-WORKSPACE: it syncs the whole copy (rsync -a, no global
+    --delete). PENDING.diff is the review gate for CONTENT, not a byte-exact
+    preview: mtimes/permissions can change without appearing in the diff.
+EOF
+  exit 0
+fi
+
 # The sandbox root must match the backend's active Hermes home (each profile
 # gets its own namespace). The backend derives it from the active Hermes home
 # + /sandbox (and honors a per-profile plugin config key "sandbox_root"); this
-# script mirrors that. PREFLIGHT_ROOT is accepted as an explicit override for
-# scripts/tests but is NOT read by the backend anymore.
+# script mirrors that. PREFLIGHT_ROOT is accepted as transport for scripts/tests
+# but is NEVER trusted on its own to decide WHERE a destructive command runs:
+# it must equal the root derived from HERMES_HOME (or $HOME/.hermes).
+if [[ -n "${HERMES_HOME:-}" ]]; then
+  EXPECTED_ROOT="${HERMES_HOME%/}/sandbox"
+else
+  EXPECTED_ROOT="${HOME:-}/.hermes/sandbox"
+fi
+EXPECTED_ROOT="$(realpath -m "$EXPECTED_ROOT" 2>/dev/null || echo "$EXPECTED_ROOT")"
+
 if [[ -n "${PREFLIGHT_ROOT:-}" ]]; then
   ROOT="$PREFLIGHT_ROOT"
 else
-  HERMES_HOME="${HERMES_HOME:-}"
-  if [[ -z "$HERMES_HOME" ]]; then
-    HERMES_HOME="$HOME/.hermes"
-  fi
-  ROOT="$HERMES_HOME/sandbox"
+  ROOT="$EXPECTED_ROOT"
+fi
+ROOT="$(realpath -m "$ROOT" 2>/dev/null || echo "$ROOT")"
+if [[ "$ROOT" != "$EXPECTED_ROOT" ]]; then
+  echo "✖ refusing PREFLIGHT_ROOT=$PREFLIGHT_ROOT: it is not this profile's sandbox root ($EXPECTED_ROOT)." >&2
+  echo "  Export HERMES_HOME=<profile hermes home> (see: sandboxctl --help) so the command targets YOUR sessions." >&2
+  exit 1
 fi
 
 cmd="${1:-status}"
 task_id="${2:-}"
 
-# --yes is honored ONLY on an interactive terminal. An agent driving a
-# subprocess (stdin not a TTY) must NEVER be able to self-approve an apply.
+# --yes is honored ONLY on an interactive terminal. This is BEST-EFFORT: a
+# determined agent can allocate a pty (script/pty module/ssh -tt) and
+# self-approve; the gate stops accidental non-TTY approvals, not a determined
+# local agent.
 have_yes=0
 for a in "$@"; do [[ "$a" == "--yes" || "$a" == "-y" ]] && have_yes=1; done
 if [[ "$have_yes" -eq 1 && ! -t 0 ]]; then
-  echo "✖ --yes is only honored on an interactive terminal. An agent cannot self-approve an apply; run it yourself." >&2
+  echo "✖ --yes is only honored on an interactive terminal (best-effort guard: a determined process can allocate a pty and self-approve). Run it yourself." >&2
   exit 2
 fi
 
@@ -120,7 +164,7 @@ case "$cmd" in
       exit 1
     fi
     current_fp="$(python3 - "$ORIG" <<'PYEOF'
-import os, sys
+import hashlib, os, sys
 from pathlib import Path
 root = Path(sys.argv[1])
 lines = []
@@ -133,29 +177,76 @@ for _root, dirs, files in os.walk(root):
             st = os.lstat(p)
         except OSError:
             continue
-        lines.append(f"{os.path.join(rel_root, d)}\t{st.st_mtime_ns}\t{st.st_size}\td")
+        lines.append(f"{os.path.join(rel_root, d)}\t{st.st_mtime_ns}\t{st.st_size}\t-\td")
     for f in files:
         p = os.path.join(_root, f)
         try:
             st = os.lstat(p)
         except OSError:
             continue
-        lines.append(f"{os.path.join(rel_root, f)}\t{st.st_mtime_ns}\t{st.st_size}\tf")
+        if os.path.islink(p):
+            try:
+                h = hashlib.sha256(os.readlink(p).encode()).hexdigest()
+            except OSError:
+                h = "-"
+        else:
+            try:
+                hs = hashlib.sha256()
+                with open(p, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(65536), b""):
+                        hs.update(chunk)
+                h = hs.hexdigest()
+            except OSError:
+                h = "-"
+        lines.append(f"{os.path.join(rel_root, f)}\t{st.st_mtime_ns}\t{st.st_size}\t{h}\tf")
 print("\n".join(sorted(lines)))
 PYEOF
 )"
     if [[ "$current_fp" != "$(cat "$FP")" ]]; then
-      echo "✖ The real workspace CHANGED since the copy was cloned. Re-sync:" >&2
+      echo "✖ The real workspace CHANGED since the copy was cloned (content, mtime or permissions). Re-sync:" >&2
       echo "    sandboxctl discard $task_id" >&2
       echo "  and let the agent create a new session. Applying now would clobber the real change." >&2
+      exit 1
+    fi
+
+    # 0b) Symlink escape scan on the copy, BEFORE the sync. A symlink pointing
+    #     outside the copy (created by an earlier command in the session) would
+    #     be copied into the real workspace as-is and let the applied tree
+    #     reach outside it. Same scan the backend's execute() runs per command.
+    escaping_syms="$(python3 - "$WS" <<'PYEOF'
+import os, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+prefix = str(root).rstrip("/") + os.sep
+escaping = []
+for p in root.rglob("*"):
+    if not p.is_symlink():
+        continue
+    try:
+        target = os.path.realpath(p)
+    except Exception:
+        target = ""
+    if not target or (target != str(root) and not target.startswith(prefix)):
+        escaping.append(str(p))
+print("\n".join(escaping[:10]))
+PYEOF
+)"
+    if [[ -n "$escaping_syms" ]]; then
+      echo "✖ Refusing to apply: the copy contains symlink(s) escaping the sandbox root:" >&2
+      echo "$escaping_syms" >&2
+      echo "  Nothing was applied. Remove the outward symlinks (or discard and start fresh) before applying." >&2
       exit 1
     fi
 
     echo "▶ Applying changes of '$task_id' to the real workspace..." 
     echo "  source : $WS"
     echo "  target : $ORIG"
-    echo "  (diff state)"
-    [[ -f "$WS/PENDING.diff" ]] && grep -E '^[+-]|^diff |^Only |^Index ' "$WS/PENDING.diff" | head -n 60 || true
+    diff_show="$(grep -E '^[+-]|^diff |^Only |^Index ' "$WS/PENDING.diff" 2>/dev/null || true)"
+    total="$(printf '%s\n' "$diff_show" | sed '/^$/d' | wc -l | tr -d ' ')"
+    printf '%s\n' "$diff_show" | head -n 60 || true
+    if (( total > 60 )); then
+      echo "  ... ($(( total - 60 )) more lines — run: sandboxctl diff $task_id for the full diff)"
+    fi
     echo
     if [[ "$have_yes" -eq 1 ]]; then
       # --yes was verified to run on an interactive terminal at the top of the
@@ -164,7 +255,7 @@ PYEOF
     elif [[ -t 0 ]]; then
       read -r -p "Apply? this OVERWRITES the real workspace [y/N]: " ans
     else
-      echo "✖ apply requires interactive confirmation; an agent cannot self-approve an apply." >&2
+      echo "✖ apply requires interactive confirmation (best-effort guard: a determined process can allocate a pty and self-approve)." >&2
       exit 2
     fi
 
@@ -202,6 +293,21 @@ PYEOF
     ;;
 
   discard)
+    # Destructive, so the same interactive gate as apply: no TTY -> refuse.
+    # (The root was already validated at startup, so PREFLIGHT_ROOT cannot aim
+    # this rm at another profile's sessions.)
+    if [[ "$have_yes" -eq 1 ]]; then
+      ans=s
+    elif [[ -t 0 ]]; then
+      read -r -p "Discard session '$task_id'? this removes the COPY, the real workspace is not touched [y/N]: " ans
+    else
+      echo "✖ discard requires interactive confirmation (best-effort guard: a determined process can allocate a pty and self-approve)." >&2
+      exit 2
+    fi
+    if [[ ! "$ans" =~ ^[sSyY]$ ]]; then
+      echo "✖ Discard cancelled."
+      exit 1
+    fi
     rm -rf -- "$ROOT/$task_id"
     echo "✔ Session '$task_id' discarded (the real workspace was not touched)."
     ;;

@@ -7,11 +7,14 @@ inside the copy too (uses_host_filesystem=False). After each command a diff is
 accumulated in PENDING.diff. Applying (whole-workspace sync copy -> real) and
 discarding are EXPLICIT actions that never happen on their own; apply is a
 single whole-workspace approval (PENDING.diff is the exact-diff review gate)
-and requires human confirmation on a terminal (an agent cannot self-approve).
+and requires human confirmation on a terminal. That check is BEST-EFFORT: a
+determined agent that allocates a pty can self-approve, so the TTY gate stops
+accidental non-TTY approvals, not a determined local agent.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -134,15 +137,37 @@ def _write_original_fingerprint(original: Path, dst: Path) -> None:
                 st = os.lstat(p)
             except OSError:
                 continue
-            lines.append(f"{os.path.join(rel_root, d)}\t{st.st_mtime_ns}\t{st.st_size}\td")
+            lines.append(f"{os.path.join(rel_root, d)}\t{st.st_mtime_ns}\t{st.st_size}\t-\td")
         for f in files:
             p = os.path.join(root, f)
             try:
                 st = os.lstat(p)
             except OSError:
                 continue
-            lines.append(f"{os.path.join(rel_root, f)}\t{st.st_mtime_ns}\t{st.st_size}\tf")
+            lines.append(f"{os.path.join(rel_root, f)}\t{st.st_mtime_ns}\t{st.st_size}\t{_fingerprint_hash(p)}\tf")
     dst.write_text("\n".join(sorted(lines)), encoding="utf-8")
+
+
+def _fingerprint_hash(path: str) -> str:
+    """sha256 of a file's content (or of the link target for symlinks).
+
+    ``-`` on any OSError keeps the snapshot write resilient; the apply guard
+    will simply see a hash change (or rely on the other columns) if a file
+    becomes unreadable.
+    """
+    if os.path.islink(path):
+        try:
+            return hashlib.sha256(os.readlink(path).encode("utf-8")).hexdigest()
+        except OSError:
+            return "-"
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return "-"
 
 
 class PreflightEnvironment:

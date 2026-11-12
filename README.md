@@ -6,10 +6,10 @@ you exactly what would change (**exact diff**), and **applies** the changes to
 the real workspace only if *you* explicitly approve them. A universal dry-run:
 a misfired `rm -rf`, a migration or a script never touches your data by accident.
 
-> One-line design: **the agent SEES the real workspace, EXECUTES on the copy,
-> and APPLIES with your approval.**
+> One-line design: **the agent SEES the copy, EXECUTES on the copy, and APPLIES
+> with your approval.**
 
-Status: `v0.1.0` · plugin `validated` · standalone sandbox test `9/9 passing` ·
+Status: `v0.1.0` · plugin `validated` · standalone sandbox test `19/19 passing` ·
 runs on `linux` and `macos`.
 
 ## Quickstart
@@ -33,7 +33,7 @@ discard the copy and the real workspace is untouched.
 |-----------------------|------------------------------|-------------------------|---------------------|--------------------------|
 | What it isolates      | the *workspace copy*         | the whole process       | the whole process   | the real filesystem      |
 | Container / kernel    | No — host process            | Yes (namespaces/bind)   | Yes (Docker)        | No (still host process)  |
-| Shows what changes    | Yes, **exact diff** + select ive apply | No — isolates, doesn't teach | No — export, no diff    | No diff                  |
+| Shows what changes    | Yes, **exact diff** + whole-workspace apply | No — isolates, doesn't teach | No — export, no diff    | No diff                  |
 | Before writing        | Diff + explicit approval     | No review gate          | No review gate      | Write-approval prompts   |
 | Re-apply to the real  | `apply`/`discard` explicit   | None (dies with ctr)    | `export` / copy     | N/A (writes go through)  |
 
@@ -61,8 +61,13 @@ diff -ruN -x PENDING.diff /real/ws /sandbox/task-AB12/workspace
 Only in /real/ws: credentials/db-password.txt
 ```
 
-You review it, then decide to `apply` (it will *selectively* sync only those
-paths) or `discard`.
+You review it, then decide to `apply` or `discard`.
+
+`apply` approves the **whole pending diff** (the entire workspace copy is
+synced into the real workspace) — it does **not** offer per-file selection.
+`PENDING.diff` is the exact-diff review gate; approving it means "sync all of
+this into the real workspace". If you want only some of those changes, edit
+the copy (or discard and start a focused session) before applying.
 
 ## How it works
 
@@ -74,15 +79,25 @@ paths) or `discard`.
   > not the primary method because they share inodes: `echo x > file` in the
   > sandbox would touch the original *without* going through `apply`. Reflink
   > gives the same "I copy no bytes" and isolates for real.
+- `create_environment()` derives the sandbox root from the **active Hermes
+  home** (`get_hermes_home() + /sandbox`), so each profile gets its own sandbox
+  namespace; a per-profile `sandbox_root` key (plugin config) overrides it.
+  Cloning the user's home or Hermes home is **refused** (`cd into a project`).
 - `execute()` runs the command in the copy with a filtered environment
   (secrets stripped), applies guards, and returns `{output, exit_code}`.
+- The backend sets `uses_host_filesystem = False`, so Hermes' file tools
+  (`read_file`, `write_file`, `patch`, `search_files`) run **inside the copy**
+  via `execute()`. They never touch the real workspace directly — every edit
+  lands behind the copy/diff/apply gate.
 - After each command it recomputes the diff original ↔ copy (`git diff
   --no-index` when there is a `.git`, `diff -ruN` otherwise) into
   `PENDING.diff`.
 - **Nothing applies on its own.** `apply` runs a sync of the copy into the real
   workspace (no global `--delete`) after verifying a fingerprint that the real
   workspace has not changed since the clone (TOCTOU); deletions are applied
-  explicitly and only for paths gone from the copy.
+  explicitly and only for paths gone from the copy. `apply` needs **human
+  confirmation on an interactive terminal** — `--yes` is honored only when
+  stdin is a TTY, so an agent driving a subprocess cannot self-approve.
 
 ## Security guards (best-effort)
 
@@ -91,6 +106,8 @@ paths) or `discard`.
   backslash escapes are stripped for the match), so wrappers like
   `bash -c 'sudo …'` are caught too.
 - Rejects absolute paths that point **outside** the copy (including a bare `/`).
+- Rejects relative paths that **escape** the copy via `..` when they would
+  resolve outside it.
 - Rejects write redirections (`>`, `2>`) to paths outside the copy.
 - Rejects the operation if the copy contains **symlinks that escape** the
   sandbox (preserved by the clone; a symlink to `/etc` or `~/.ssh` would
@@ -127,6 +144,11 @@ paths) or `discard`.
 
 ## Honest limitations
 
+- **The copy is not a boundary against the agent**: a relative `../` path can
+  reach outside it (the guards reject obvious cases, but a determined command
+  string can still escape). The real protection is that apply needs **your**
+  explicit approval on a terminal — an agent cannot self-approve (`--yes` is
+  honored only when stdin is a terminal).
 - **Not a real kernel sandbox.** The shell runs on the host (the `cwd` is a
   copy). Path/sudo guards are best-effort pattern matching and a cleverer
   nested shell could still evade them (e.g. `bash -c 'sudo …'` wrapped in

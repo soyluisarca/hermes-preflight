@@ -5,12 +5,15 @@
 #
 # apply    : syncs the sandbox copy INTO the real workspace (whole-workspace,
 #            no per-file selection) and applies explicit deletions, NEVER a
-#            global --delete. First verifies (fingerprint) that the real
-#            workspace did not change since the clone (TOCTOU) and that the
-#            copy contains no symlink escaping the sandbox root. Requires
+#            global --delete. First validates the registered target (refuses
+#            home / Hermes home / credential stores / system dirs / anything
+#            inside the sandbox root), then verifies (fingerprint) that the real
+#            workspace did not change since the clone (TOCTOU) and that the copy
+#            contains no symlink escaping the sandbox root. Requires
 #            confirmation: --yes is honored ONLY when stdin is a terminal.
-# discard  : removes the copy. The real workspace is not touched. Requires
-#            the same interactive confirmation as apply.
+# discard  : removes the copy. The real workspace is not touched, and the
+#            registered target is never read: discard works on any session.
+#            Requires the same interactive confirmation as apply.
 # status   : lists existing sessions and their PENDING.diff.
 # diff     : prints a session's PENDING.diff.
 set -euo pipefail
@@ -42,9 +45,11 @@ Security notes (read carefully):
     If the marker is missing, the CLI uses the derived root. The marker is a
     convenience, not a security boundary (the staging root is writable by the
     sandboxed agent).
-  * PREFLIGHT_ROOT is transport-only (set by the backend for child scripts)
-    and MUST match the effective root (marker or derived); a mismatched value
-    is refused.
+  * PREFLIGHT_ROOT is not exported to sandboxed commands anymore, but that is
+    not a hiding boundary: a child still derives the root from its cwd
+    (<root>/<id>/workspace) or from its pinned $TMPDIR. The variable is
+    accepted as transport for scripts/tests and MUST match the effective root
+    (marker or derived); a mismatched value is refused.
   * apply is WHOLE-WORKSPACE: it syncs the whole copy (rsync -a, no global
     --delete). PENDING.diff is the review gate for CONTENT, not a byte-exact
     preview: mtimes/permissions can change without appearing in the diff.
@@ -160,14 +165,11 @@ esac
 WS="$(_resolve_under_root "$WS")" || exit 1
 [[ -d "$WS" ]] || { echo "session not found: $task_id"; exit 1; }
 
-[[ -f "$ORIGIN_FILE" ]] || { echo "missing original-workspace record for $task_id"; exit 1; }
-ORIG="$(cat "$ORIGIN_FILE")"
-[[ "$ORIG" = /* ]] || { echo "invalid original workspace: $ORIG"; exit 1; }
-[[ -d "$ORIG" ]] || { echo "invalid original workspace: $ORIG"; exit 1; }
-# Never apply back onto the copy itself, and never onto the sandbox staging dir.
-case "$(realpath -m "$ORIG")" in
-  "$ROOT"/*) echo "✖ refusing to apply onto a path inside the sandbox root: $ORIG" >&2; exit 1 ;;
-esac
+# NOTE: everything below that reads $ORIG (the registration record) is apply-only
+# and lives INSIDE the `apply)` case. `discard` never reads the record: its
+# `rm -rf "$ROOT/$task_id"` is already confined to the validated root, so a
+# session whose record was rewritten to a dangerous path must still be
+# discardable (it is the only way out the plugin offers).
 
 # Fingerprint of the real workspace at clone time (TOCTOU guard).
 FP="$ROOT/$task_id/original.fingerprint"
@@ -223,7 +225,63 @@ case "$cmd" in
     ;;
 
   apply)
-    # 0) TOCTOU: the real workspace must not have changed since the clone.
+    # 0) Is this a legitimate apply target? The registration record is writable
+    #    inside the staging root, so a crafted <id>/original could aim a
+    #    whole-workspace rsync at the user's home, the Hermes home, a credential
+    #    store or a system dir. Refuse BEFORE any rsync. Apply-only: `discard`
+    #    never reads this record (see the note before the fingerprint block).
+    [[ -f "$ORIGIN_FILE" ]] || { echo "missing original-workspace record for $task_id"; exit 1; }
+    ORIG="$(cat "$ORIGIN_FILE")"
+    [[ "$ORIG" = /* ]] || { echo "invalid original workspace: $ORIG"; exit 1; }
+    [[ -d "$ORIG" ]] || { echo "invalid original workspace: $ORIG"; exit 1; }
+    # Never apply back onto the copy itself, and never onto the sandbox staging dir.
+    ORIG_REAL="$(realpath -m "$ORIG" 2>/dev/null || echo "$ORIG")"
+    case "$ORIG_REAL" in
+      "$ROOT"/*) echo "✖ refusing to apply onto a path inside the sandbox root: $ORIG" >&2; exit 1 ;;
+    esac
+
+    # Dangerous apply targets (same list as the backend's
+    # _reject_forbidden_original, __init__.py). Refuse before ANY rsync.
+    HOME_REAL="$(realpath -m "${HOME:-/nonexistent}" 2>/dev/null || echo "${HOME:-/nonexistent}")"
+    if [[ -n "${HERMES_HOME:-}" ]]; then
+      HERMES_HOME_REAL="$(realpath -m "$HERMES_HOME" 2>/dev/null || echo "${HERMES_HOME%/}")"
+    else
+      HERMES_HOME_REAL="$HOME_REAL/.hermes"
+    fi
+
+    # _is_under <path> <dir>: true when <path> equals <dir> or lives below it.
+    _is_under() {
+      local p="$1" d="$2"
+      [[ "$d" == "/" ]] && return 0
+      [[ "$p" == "$d" || "$p" == "$d"/* ]]
+    }
+
+    if [[ "$ORIG_REAL" == "$HOME_REAL" ]]; then
+      echo "✖ refusing to apply onto your home directory: $ORIG_REAL" >&2
+      echo "  A whole-workspace apply onto ~ would overwrite your personal files. Discard this session and start one in a project directory." >&2
+      exit 1
+    fi
+    if _is_under "$ORIG_REAL" "$HERMES_HOME_REAL"; then
+      echo "✖ refusing to apply onto the Hermes home: $ORIG_REAL" >&2
+      echo "  Applying there would overwrite Hermes' own config/sessions. Discard this session and start one in a project directory." >&2
+      exit 1
+    fi
+    for _sens in .ssh .aws .gnupg; do
+      if _is_under "$ORIG_REAL" "$HOME_REAL/$_sens"; then
+        echo "✖ refusing to apply onto a sensitive directory under your home: $ORIG_REAL" >&2
+        echo "  Credential stores are never an apply target. Discard this session." >&2
+        exit 1
+      fi
+    done
+    for _sys in /etc /var; do
+      if _is_under "$ORIG_REAL" "$_sys"; then
+        echo "✖ refusing to apply onto a system directory: $ORIG_REAL" >&2
+        echo "  System directories are never an apply target. Discard this session." >&2
+        exit 1
+      fi
+    done
+
+    # 0a) TOCTOU: the real workspace must not have changed since the clone.
     #    Without a fingerprint we cannot guarantee it -> do not apply.
     if [[ ! -f "$FP" ]]; then
       echo "✖ Session created without an integrity fingerprint; cannot guarantee the real workspace did not change." >&2
@@ -335,7 +393,10 @@ PYEOF
   discard)
     # Destructive, so the same interactive gate as apply: no TTY -> refuse.
     # (The root was already validated at startup, so PREFLIGHT_ROOT cannot aim
-    # this rm at another profile's sessions.)
+    # this rm at another profile's sessions.) Deliberately does NOT read the
+    # registration record: whatever $ORIG says, this rm stays inside ROOT, and
+    # discard must remain the way out of a session whose record was tampered
+    # with (it never applies anything).
     if [[ "$have_yes" -eq 1 ]]; then
       ans=s
     elif [[ -t 0 ]]; then

@@ -44,11 +44,17 @@ def _derive_sandroot() -> Path:
 SANDROOT = _derive_sandroot()
 
 # Exact environment variable names that must never reach the subprocess (secrets).
+# PREFLIGHT_ROOT / SANDBOX_FIRST_ROOT are here too: they are NOT exported by the
+# plugin anymore, but a PARENT process (an older runtime, a wrapper, HERMES_HOME
+# transport scripts, a user shell) may still set them. Filtering them out is what
+# actually keeps the staging-root map away from the child: merely not setting a
+# key does not remove one already present in os.environ.
 _STRIP_ENV_KEYS = frozenset({
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
     "SSH_AUTH_SOCK", "NPM_TOKEN", "GH_TOKEN", "GITHUB_TOKEN",
     "GOOGLE_APPLICATION_CREDENTIALS", "FAL_KEY", "FAL_API_KEY",
     "NOUS_API_KEY",
+    "PREFLIGHT_ROOT", "SANDBOX_FIRST_ROOT",
 })
 
 # Sensitive variable prefixes also filtered (deny-list by prefix).
@@ -128,9 +134,8 @@ def _expand_var_tokens(token: str, env: dict) -> str:
     does, which turns an absolute-looking residue into a real absolute path).
 
     Variables that ARE set are left untouched for bash: expanding them here
-    would manufacture false positives ($PATH, $TMPDIR with a long value, a
-    staging-root path such as $PREFLIGHT_ROOT/... are all legitimate or
-    best-effort-covered strings). This is a documented heuristic: an attacker
+    would manufacture false positives ($PATH, $TMPDIR with a long value are
+    legitimate strings). This is a documented heuristic: an attacker
     can still build a path from set variables inside the command; the guards
     close the empty-variable class, not the whole language.
     """
@@ -373,9 +378,23 @@ class PreflightEnvironment:
         Not a real sandbox (the shell runs on the host), so this guard is an
         honest safety net, not an impenetrable wall. Variables are expanded
         against the child's env FIRST, so ``cat $EMPTY/etc/passwd`` (EMPTY
-        unset -> ``/etc/passwd``) and ``cat $PREFLIGHT_ROOT/victim/original``
-        (a sibling session's record) are judged the way bash will run them,
-        while ``$HOME`` / ``$TMPDIR`` (pinned to the copy) stay inside.
+        unset -> ``/etc/passwd``) is judged the way bash will run it, while
+        ``$HOME`` / ``$TMPDIR`` (pinned to the copy) stay inside.
+
+        A path that points INSIDE the sandbox root but outside this session's
+        copy (e.g. a sibling session's ``<root>/victim/original`` record) is
+        NOT blocked here: the boundary test is the copy, not the staging root.
+        The staging root is shared and documented as not a trust boundary.
+        ``PREFLIGHT_ROOT`` / ``SANDBOX_FIRST_ROOT`` are no longer exported, but
+        the child can still DERIVE the root from its own ``cwd``
+        (``<root>/<task_id>/workspace``) or from ``$TMPDIR`` (pinned to
+        ``<root>/<task_id>/workspace/.preflight-tmp``). A script (``python3 -c``,
+        ``bash script.sh``) can therefore read or overwrite a sibling session's
+        ``original`` / ``original.fingerprint`` records; the string scan does
+        not see inside scripts — that is the documented gap, not a kernel
+        sandbox. A tampered record can aim ``apply`` at a non-dangerous target,
+        so ``sandboxctl apply`` also refuses dangerous destinations (same list
+        as the backend's ``_reject_forbidden_original``) before any rsync.
         """
         problems: list[str] = []
         try:
@@ -537,12 +556,24 @@ class PreflightEnvironment:
         for var in ("TMP", "TEMP"):
             if var in env:
                 env[var] = str(tmp_dir)
-        # Pass the sandbox ROOT to children (notably `sandboxctl` invoked from inside
-        # a command) so they target THIS profile's root. HERMES_HOME is stripped by
-        # the sanitizer and HOME is pinned to the copy, so a child would otherwise not
-        # know where the real sessions live. PREFLIGHT_ROOT is plugin-internal
-        # transport now (not a user config surface).
-        env["PREFLIGHT_ROOT"] = str(self.sandbox_path.parent.parent)
+        # Belt and braces: the deny-list above also strips PREFLIGHT_ROOT /
+        # SANDBOX_FIRST_ROOT, so a value inherited from the parent cannot leak
+        # into the child either (removing an explicit export is not enough).
+        env.pop("PREFLIGHT_ROOT", None)
+        env.pop("SANDBOX_FIRST_ROOT", None)
+        # PREFLIGHT_ROOT is deliberately NOT exported to children anymore. It
+        # used to hand the agent a map of the staging root, and paths inside
+        # that root (e.g. <root>/<id>/original and original.fingerprint of
+        # ANOTHER session) pass the path guards, since those only block paths
+        # OUTSIDE the copy. Removing it removes the explicit map, but NOT the
+        # root itself: the child's cwd IS <root>/<id>/workspace and $TMPDIR is
+        # pinned to <root>/<id>/workspace/.preflight-tmp, so a child can still
+        # derive the root (pwd, echo $TMPDIR, $TMPDIR/../..). The guards reject
+        # literal/expanded ../ forms, not script contents, so a script can edit
+        # sibling records; sandboxctl apply's dangerous-target check is the net.
+        # Nothing in the plugin needs the variable on the child side: sandboxctl
+        # runs OUTSIDE the sandbox and derives its root from HERMES_HOME or the
+        # .preflight-root marker, never from a child's env.
         return env
 
     def execute(self, command: str, timeout: int | None = None, **kwargs):
@@ -590,6 +621,14 @@ class PreflightEnvironment:
                 capture_output=True,
                 text=True,
                 timeout=effective_timeout,
+                # stdin is NEVER inherited from the parent process: in the
+                # interactive Hermes CLI the parent's fd 0 IS the user's
+                # terminal, so an inherited stdin would let a command run
+                # `sandboxctl apply <id> --yes` and PASS the TTY check (a real
+                # tty on fd 0) with no human approval. DEVNULL gives the child
+                # an EOF-only stdin, so `-t 0` is false inside the sandbox.
+                # Same contract as Hermes' own local backend.
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired as exc:
             return {

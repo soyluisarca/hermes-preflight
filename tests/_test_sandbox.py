@@ -33,6 +33,17 @@ Cubre (del más antiguo al más nuevo):
  28. ciclo post-apply: PENDING vacío + fingerprint refrescado -> misma task_id reutilizable,
  29. README confiesa por nombre $TMPDIR, bash script.sh, python3 -c, staging no fortaleza,
  30. staging root no es trust boundary (registro/fingerprint compartidos y documentados).
+ 31. ronda 4: el hijo NO hereda stdin (sin TTY) -> apply --yes desde el sandbox rechazado,
+ 32. ronda 4: PREFLIGHT_ROOT no está en el env del hijo,
+ 33. ronda 4: apply rechaza ORIG peligroso (home, Hermes home, .ssh, /etc, /var) antes del rsync;
+     un ORIG normal sigue aplicando,
+ 34. ronda 4 + 5: los checks de ORIG están ANTES del primer rsync y DENTRO del
+     caso apply (el arranque no los corre: discard no los ve),
+ 35. test_claim_honest: fija el límite CONFESADO — el hijo deriva el root de su
+     cwd/$TMPDIR y un script (python3 -c) reescribe el registro `original` de
+     otra sesión; `apply` sigue rechazando destinos peligrosos (fix 3).
+ 36. ronda 5 (B2): contrato apply-rechaza / discard-borra con la sesión real y el
+     registro manipulado a HOME: apply rc!=0 sin escribir, discard rc=0 y borra.
 """
 import json
 import os
@@ -639,15 +650,19 @@ assert "human tty confirmation" in low or "tty confirmation" in low, "README no 
 bump(29)
 
 # --- 30) staging root NO es fortaleza: T1/T2b confesados por nombre (doc, no silencio) ---
-# El brief pide documentar que desde la copia un agente PUEDE leer/sobrescribir
-# el registro de otra sesión vía $PREFLIGHT_ROOT (el fingerprint es escribible)
-# y que la TTY humana es el límite real. Verificamos que NO se promete lo
-# contrario: el área de staging es un workspace compartido y el README lo dice.
+# El brief pide documentar que el staging root es compartido y que la TTY humana
+# es el límite real. Ronda 4: PREFLIGHT_ROOT YA NO se inyecta al hijo (el agente
+# no recibe el mapa del root), así que el observable cambia de "la variable está
+# presente" a "la variable está AUSENTE y el root no se filtra". Los registros
+# siguen viviendo compartidos en disco y el README lo confiesa.
 ws_vict = make_ws(prefix="ws-vict-")
 env_vict = provider.create_environment(cwd=str(ws_vict), timeout=15, task_id="victim30")
-# observable 1: el runtime inyecta PREFLIGHT_ROOT al hijo (el staging root)
-r_root = env_vict.execute("echo $PREFLIGHT_ROOT")
-assert r_root["exit_code"] == 0 and SB_ROOT.as_posix() in r_root["output"], f"PREFLIGHT_ROOT no inyectado: {r_root['output']}"
+# observable 1: el runtime NO inyecta PREFLIGHT_ROOT al hijo (ronda 4, fix 2)
+r_root = env_vict.execute("echo \"[$PREFLIGHT_ROOT]\"")
+assert r_root["exit_code"] == 0 and r_root["output"].strip() == "[]", (
+    f"PREFLIGHT_ROOT todavía visible en el hijo: {r_root['output']!r}"
+)
+assert SB_ROOT.as_posix() not in r_root["output"], "el hijo puede nombrar el sandbox root"
 # observable 2: los registros viven como archivos planos bajo el root compartido
 orig_file = SB_ROOT / "victim30" / "original"
 fp_file = SB_ROOT / "victim30" / "original.fingerprint"
@@ -666,9 +681,310 @@ code_v, out_v = run_sbctl_tty("discard", "victim30", answer="s\n")
 assert code_v == 0, f"discard victim30 falló: {out_v}"
 bump(30)
 
+# --- 31) ronda 4, fix 1: el hijo NO hereda el stdin del padre (sin TTY) ---
+# En el CLI interactivo, fd 0 del padre ES la terminal del usuario. Si el comando
+# del agente heredara ese stdin, `-t 0` sería true dentro del sandbox y
+# `sandboxctl apply <id> --yes` pasaría el check de TTY sin humano. Probamos con
+# el PROPIO stdin de este test puesto en un pty: el hijo debe seguir sin TTY.
+ws_stdin = make_ws(prefix="ws-stdin-")
+env_stdin = provider.create_environment(cwd=str(ws_stdin), timeout=15, task_id="stdin4")
+env_stdin.execute("echo x > change.txt")
+_master, _slave = pty.openpty()
+_saved_fd0 = os.dup(0)
+os.dup2(_slave, 0)
+try:
+    r_tty = env_stdin.execute('[ -t 0 ] && echo HAS-TTY || echo NO-TTY; python3 -c "import sys; print(\'ISTTY\', sys.stdin.isatty())"')
+    # el apply intentado desde el sandbox con --yes debe ser rechazado (no-TTY).
+    # Copiamos sandboxctl DENTRO de la copia: así el comando es relativo (los
+    # guards de paths absolutos no lo bloquean) y lo único que puede pararlo es
+    # el check de TTY de sandboxctl --exactamente el vector que cierra fix 1.
+    shutil.copy2(PLUGIN_DIR / "bin" / "sandboxctl", Path(env_stdin.sandbox_cwd) / "sbctl")
+    r_apply = env_stdin.execute(
+        "bash sbctl apply stdin4 --yes; echo RC=$?; "
+        "bash sbctl discard stdin4 --yes; echo RC=$?"
+    )
+finally:
+    os.dup2(_saved_fd0, 0)
+    os.close(_saved_fd0)
+    os.close(_master)
+    os.close(_slave)
+assert "NO-TTY" in r_tty["output"] and "ISTTY False" in r_tty["output"], (
+    f"el hijo heredó el stdin del padre (TTY visible): {r_tty['output']!r}"
+)
+assert r_apply["output"].count("RC=0") == 0, f"apply/discard --yes desde el sandbox NO fueron rechazados: {r_apply['output']!r}"
+assert "RC=2" in r_apply["output"], f"se esperaba exit 2 de no-TTY: {r_apply['output']!r}"
+assert not (ws_stdin / "change.txt").exists(), "apply desde el sandbox tocó el workspace real"
+assert r_apply["output"].lower().count("only honored on an interactive terminal") >= 2, (
+    f"el rechazo no es el de TTY: {r_apply['output']!r}"
+)
+bump("31")
+
+# --- 32) ronda 4, fix 2: PREFLIGHT_ROOT ausente del env del hijo ---
+r_pr = env_stdin.execute("env | grep -c '^PREFLIGHT_ROOT=' || true")
+assert r_pr["output"].strip().endswith("0") or r_pr["output"].strip() == "0", (
+    f"PREFLIGHT_ROOT sigue en el env del hijo: {r_pr['output']!r}"
+)
+probe_pr = (
+    "python3 -c \"import os; print('HAS_PR', 'PREFLIGHT_ROOT' in os.environ); "
+    "print('HAS_SFR', 'SANDBOX_FIRST_ROOT' in os.environ)\""
+)
+r_pr2 = env_stdin.execute(probe_pr)
+assert r_pr2["exit_code"] == 0 and "HAS_PR False" in r_pr2["output"], f"{r_pr2['output']!r}"
+assert "HAS_SFR False" in r_pr2["output"], f"{r_pr2['output']!r}"
+bump("32")
+
+# --- 33) ronda 4, fix 3: apply rechaza un ORIG peligroso (registro manipulado) ---
+# Craft a session under the test root whose <id>/original points at HOME, the
+# Hermes home, ~/.ssh, /etc... and check apply refuses BEFORE any rsync.
+def _craft_session(sid: str, orig: str):
+    d = SB_ROOT / sid
+    (d / "workspace").mkdir(parents=True, exist_ok=True)
+    (d / "workspace" / "PENDING.diff").write_text("# pending\n", encoding="utf-8")
+    (d / "original").write_text(orig, encoding="utf-8")
+    # Bogus fingerprint ON PURPOSE: the ORIG check must refuse BEFORE the
+    # fingerprint stage, so the error must be the ORIG one and never "CHANGED".
+    # (Also avoids hashing all of /etc or /var just to build a fixture.)
+    (d / "original.fingerprint").write_text("deliberately-not-matching", encoding="utf-8")
+
+dangerous = {
+    "home4": str(Path.home()),
+    "home4-sub": str(Path.home() / ".ssh"),
+    "home4-aws": str(Path.home() / ".aws"),
+    "hermes4": str(Path(os.environ["HERMES_HOME"])),
+    "hermes4-sub": str(Path(os.environ["HERMES_HOME"]) / "sandbox"),
+    "etc4": "/etc",
+    "etc4-sub": "/etc/ssl",
+    "var4": "/var",
+}
+for sid, orig in dangerous.items():
+    if not Path(orig).is_dir():
+        print(f"  (skip {orig}: no existe en esta máquina)")
+        continue
+    _craft_session(sid, orig)
+    code, out = run_sbctl_tty("apply", sid, answer="s\n")
+    assert code != 0, f"apply onto dangerous ORIG ({orig}) NO fue rechazado: {out}"
+    assert "refusing to apply" in out, f"mensaje de rechazo ausente para {orig}: {out[:400]}"
+    assert "CHANGED" not in out.upper(), (
+        f"el ORIG peligroso ({orig}) se rechazó por fingerprint, no por el check nuevo: {out[:400]}"
+    )
+    print(f"  ({orig}) {out.strip().splitlines()[0]}")
+    shutil.rmtree(SB_ROOT / sid, ignore_errors=True)
+bump("33a")
+# control: un ORIG normal sigue aplicando
+ws_ctrl = make_ws(prefix="ws-ctrl4-")
+env_ctrl = provider.create_environment(cwd=str(ws_ctrl), timeout=15, task_id="ctrl4")
+assert env_ctrl.execute("echo ok > ok.txt")["exit_code"] == 0
+code_c, out_c = run_sbctl_tty("apply", "ctrl4", answer="s\n")
+assert code_c == 0, f"apply legítimo bloqueado por el check nuevo: {out_c}"
+assert (ws_ctrl / "ok.txt").exists(), "apply legítimo no aplicó"
+bump("33b")
+
+# --- 34) ronda 4 + ronda 5 (B2): los checks de ORIG están ANTES del primer
+# rsync Y viven DENTRO del caso apply (no en la validación de arranque, que
+# también corre en discard). Contrato: en el flujo apply todo rechazo de ORIG
+# ocurre antes del rsync; discard no los ejecuta.
+sb_text = (PLUGIN_DIR / "bin" / "sandboxctl").read_text()
+apply_off = sb_text.index("  apply)")
+apply_end = sb_text.index("  discard)", apply_off)
+first_rsync = sb_text.index("rsync -a --exclude=PENDING.diff", apply_off)
+assert apply_off < first_rsync < apply_end, "el primer rsync de apply no está en el caso apply"
+# "apply)" se nombra también en el gate --yes (detección del flag); el caso real
+# es el único seguido de newline en columna 2.
+assert sb_text.count("\n  apply)\n") == 1, "se esperaba UN solo caso apply)"
+assert len(re.findall(r"^\s*rsync -a ", sb_text, re.M)) == 1, "se esperaba UN solo rsync -a (el de apply)"
+_checks = ("refusing to apply onto your home directory",
+           "refusing to apply onto the Hermes home",
+           "refusing to apply onto a sensitive directory",
+           "refusing to apply onto a system directory",
+           'ORIG="$(cat "$ORIGIN_FILE")"',
+           "_is_under() {")
+for needle in _checks:
+    assert needle in sb_text, f"falta el check: {needle}"
+    assert sb_text.index(needle) < first_rsync, f"el check '{needle}' está DESPUÉS del rsync"
+    assert apply_off < sb_text.index(needle) < apply_end, (
+        f"el check '{needle}' no está dentro del caso apply (¿volvió al arranque?): "
+        f"offset {sb_text.index(needle)}, apply {apply_off}-{apply_end}"
+    )
+# El arranque (entre el gate --yes y el case) NO corre ningún check de ORIG.
+_startup = sb_text[:sb_text.index('case "$cmd" in')]
+for needle in ("refusing to apply", "$ORIGIN_FILE", "_is_under"):
+    assert needle not in _startup, f"'{needle}' sigue en la validación de arranque (rompe discard)"
+bump("34")
+
+# --- 35) test_claim_honest: the child CAN derive the root and rewrite a
+# sibling's record via a script. This PINS THE CONFESSED LIMIT, it does not
+# prove the hole is closed: the claim "a command cannot obtain that root from
+# its environment" was false (snapshot claim) and this test documents reality.
+#  a) the root is derivable from the child's own cwd and from the pinned $TMPDIR;
+#  b) a python3 -c (script) rewrites ANOTHER real session's `original` record to
+#     a non-dangerous target without the string scan seeing it;
+#  c) that tampered record does NOT reach a dangerous target: apply refuses it
+#     (the remaining net is apply's dangerous-destination check, fix 3).
+ws_vic35 = make_ws(prefix="ws-vic35-")
+env_vic35 = provider.create_environment(cwd=str(ws_vic35), timeout=15, task_id="victim35")
+ws_att35 = make_ws(prefix="ws-att35-")
+env_att35 = provider.create_environment(cwd=str(ws_att35), timeout=15, task_id="attacker35")
+victim_root = (SB_ROOT / "victim35").as_posix()
+
+# a) cwd derives the root: <root>/victim35/workspace is exactly the copy's cwd.
+r_pwd = env_vic35.execute("pwd")
+assert r_pwd["exit_code"] == 0, f"pwd falló: {r_pwd!r}"
+cwd_seen = r_pwd["output"].strip()
+assert cwd_seen.endswith("/workspace"), f"cwd inesperado en el hijo: {cwd_seen!r}"
+assert Path(cwd_seen).parent.parent.as_posix() == SB_ROOT.as_posix(), (
+    f"el padre del padre del cwd no es el root ({cwd_seen!r} -> {SB_ROOT})"
+)
+assert SB_ROOT.as_posix() in cwd_seen, "el cwd del hijo no contiene el root"
+# a2) $TMPDIR is pinned INSIDE the copy, so it names the root as well.
+r_tmp = env_vic35.execute('echo "$TMPDIR"')
+assert r_tmp["exit_code"] == 0, f"echo $TMPDIR falló: {r_tmp!r}"
+tmp_seen = r_tmp["output"].strip()
+assert Path(tmp_seen).as_posix() == (Path(env_vic35.sandbox_cwd) / ".preflight-tmp").as_posix(), (
+    f"$TMPDIR no está pinneado dentro de la copia: {tmp_seen!r}"
+)
+assert Path(tmp_seen).parent.parent.parent.as_posix() == SB_ROOT.as_posix(), (
+    f"$TMPDIR no deriva el root ({tmp_seen!r} -> {SB_ROOT})"
+)
+# a3) the child can walk from $TMPDIR to the root with a SHELL cast that the
+# guards catch (documented), but a script does it freely (b below).
+r_dotdot = env_att35.execute('cd "$TMPDIR/../.." && pwd')
+assert r_dotdot["exit_code"] == 1, (
+    f"un cast de shell con $TMPDIR/../.. NO fue bloqueado (esto no es lo confesado): {r_dotdot!r}"
+)
+bump("35a")
+
+# b) script gap: python3 -c is not scanned, so it rewrites the victim's record.
+assert (SB_ROOT / "victim35" / "original").read_text().strip() == str(ws_vic35), (
+    "registro del victim corrupto antes del test"
+)
+fake_target = ws_att35  # non-dangerous destination: a plain temp dir
+script = (
+    "import pathlib, os\n"
+    "tmp = pathlib.Path(os.environ['TMPDIR'])\n"
+    "root = tmp.parent.parent.parent\n"
+    "victim = root / 'victim35' / 'original'\n"
+    f"victim.write_text({str(fake_target)!r})\n"
+    "print('WROTE_TO', victim)\n"
+    "print('NOW', victim.read_text().strip())\n"
+)
+r_script = env_att35.execute(f'python3 -c "{script}"')
+assert r_script["exit_code"] == 0, f"el script fue bloqueado (no es el comportamiento confesado): {r_script!r}"
+assert f"WROTE_TO {victim_root}/original" in r_script["output"], f"{r_script['output']!r}"
+# the write really landed on the victim's real registration record
+assert (SB_ROOT / "victim35" / "original").read_text().strip() == str(fake_target), (
+    "el script NO reescribió el registro del victim (contradice el gap confesado)"
+)
+bump("35b")
+
+# c) the tampered record cannot reach a DANGEROUS target: apply refuses it.
+#    (Same net as test 33, reached here through the sibling-record vector.)
+for dangerous_orig in (str(Path.home()), "/etc"):
+    if not Path(dangerous_orig).is_dir():
+        continue
+    (SB_ROOT / "victim35" / "original").write_text(dangerous_orig)
+    code_d, out_d = run_sbctl_tty("apply", "victim35", answer="s\n")
+    assert code_d != 0, f"apply con registro manipulado -> {dangerous_orig} NO fue rechazado: {out_d}"
+    assert "refusing to apply" in out_d, f"mensaje de rechazo ausente ({dangerous_orig}): {out_d[:400]}"
+bump("35c")
+
+# cleanup: discard the victim session. Ronda 5 (B2): discard NO lee el registro,
+# así que se descarta con el registro todavía apuntando a /etc — exactamente lo
+# que antes fallaba (rc=1 "refusing to apply ... Discard this session").
+code_v35, out_v35 = run_sbctl_tty("discard", "victim35", answer="s\n")
+assert code_v35 == 0, f"discard victim35 falló (registro a /etc): {out_v35}"
+assert not (SB_ROOT / "victim35").exists(), "la sesión victim35 sobrevivió al discard (registro a /etc)"
+code_a35, out_a35 = run_sbctl_tty("discard", "attacker35", answer="s\n")
+assert code_a35 == 0, f"discard attacker35 falló: {out_a35}"
+assert not (SB_ROOT / "victim35").exists(), "la sesión victim35 sobrevivió al discard"
+print("  (35 fija el límite confesado: root derivable + registro ajeno escribible por script)")
+bump("35")
+
+# --- 36) ronda 5 (B2): contrato apply-rechaza / discard-borra sobre una sesión
+# real cuyo registro `original` fue manipulado a un destino peligroso.
+#  (a) apply --yes (TTY) -> rc!=0 con "refusing", y NADA se escribe en el
+#      destino peligroso (comparación de contenido de HOME antes/después);
+#  (b) discard --yes (TTY) -> rc=0, el directorio ya no existe y el mensaje no
+#      contiene "refusing to apply" (discard no mira $ORIG).
+ws_b236 = make_ws({"keep.txt": "original\n"}, prefix="ws-b236-")
+env_b236 = provider.create_environment(cwd=str(ws_b236), timeout=15, task_id="b236")
+assert env_b236.execute("echo changed > injected.txt")["exit_code"] == 0
+sess36 = SB_ROOT / "b236"
+assert (sess36 / "workspace").is_dir() and (sess36 / "original").is_file(), "sesión b236 incompleta"
+# marcador único en la copia: si apply corriera, aparecería en el destino
+marker36 = f"preflight-b2-marker-{os.getpid()}-{int(time.time())}"
+assert env_b236.execute(f"echo {marker36} > b2marker.txt")["exit_code"] == 0
+
+home36 = Path.home()
+def _home_snapshot():
+    try:
+        return sorted(p.name for p in home36.iterdir())
+    except OSError:
+        return []
+home_before = _home_snapshot()
+
+danger36 = str(home36)  # HOME: el vector del fix 2 (rechazo de "your home directory")
+sess36.joinpath("original").write_text(danger36, encoding="utf-8")
+
+# (a) apply rechaza: rc!=0, mensaje refusing, y no se escribió nada en HOME
+code_a, out_a = run_sbctl_tty("apply", "b236", answer="s\n")
+assert code_a != 0, f"B2(a): apply con registro {danger36} NO fue rechazado: {out_a[:600]}"
+assert "refusing to apply" in out_a, f"B2(a): mensaje de rechazo ausente: {out_a[:600]}"
+assert not (home36 / "b2marker.txt").exists() and not (home36 / "injected.txt").exists(), (
+    "B2(a): apply escribió en HOME pese al rechazo"
+)
+assert _home_snapshot() == home_before, "B2(a): el contenido de HOME cambió durante el apply rechazado"
+assert (sess36 / "workspace").is_dir(), "B2(a): el rechazo borró la sesión"
+print(f"  (B2a) apply -> rc={code_a}: {out_a.strip().splitlines()[0]}")
+
+# (b) discard borra la sesión pese al registro peligroso (sigue apuntando a HOME)
+code_d, out_d = run_sbctl_tty("discard", "b236", answer="s\n")
+assert code_d == 0, f"B2(b): discard falló con registro {danger36}: rc={code_d} {out_d[:600]}"
+assert not sess36.exists(), "B2(b): el directorio de la sesión sigue existiendo tras discard"
+assert "refusing to apply" not in out_d, f"B2(b): discard imprimió el texto de apply: {out_d[:600]}"
+assert "discarded" in out_d.lower(), f"B2(b): falta la confirmación de discard: {out_d[:600]}"
+assert _home_snapshot() == home_before, "B2(b): HOME cambió durante discard"
+print(f"  (B2b) discard -> rc={code_d}: {out_d.strip().splitlines()[-1]}")
+bump("36")
+
+# --- 37) ronda 4, fix 2 (endurecido): PREFLIGHT_ROOT / SANDBOX_FIRST_ROOT
+# TAMPOCO se filtran si ya vienen en el entorno del PADRE. El test 32 arranca
+# con esas variables eliminadas (líneas ~71-72), así que un `env` sin ellas
+# pasaba trivialmente; el contrato real es que el hijo NO las vea aunque el
+# padre las exporte (el runtime real puede hacerlo, y un export previo no lo
+# borra "no volviendo a exportar"). Se comprueba con un Environment nuevo
+# creado mientras el padre las tiene definidas, y se restaura el entorno.
+_prev_pr = os.environ.get("PREFLIGHT_ROOT", None)
+_prev_sfr = os.environ.get("SANDBOX_FIRST_ROOT", None)
+os.environ["PREFLIGHT_ROOT"] = "/legacy/preflight/root/from/parent"
+os.environ["SANDBOX_FIRST_ROOT"] = "/legacy/sandbox/first/root/from/parent"
+try:
+    env_pr37 = provider.create_environment(cwd=str(ws), timeout=15, task_id="pr37")
+    child_env37 = env_pr37._make_env()
+    assert "PREFLIGHT_ROOT" not in child_env37, (
+        "PREFLIGHT_ROOT heredado del padre llegó al entorno del hijo: "
+        f"{child_env37.get('PREFLIGHT_ROOT')!r}"
+    )
+    assert "SANDBOX_FIRST_ROOT" not in child_env37, (
+        f"SANDBOX_FIRST_ROOT heredado del padre llegó al hijo: {child_env37.get('SANDBOX_FIRST_ROOT')!r}"
+    )
+    r_pr37 = env_pr37.execute("env | grep '^PREFLIGHT_ROOT=\\|^SANDBOX_FIRST_ROOT=' || echo AUSENTE")
+    assert r_pr37["output"].strip() == "AUSENTE", (
+        f"el hijo ve las variables heredadas del padre: {r_pr37['output']!r}"
+    )
+finally:
+    if _prev_pr is None:
+        os.environ.pop("PREFLIGHT_ROOT", None)
+    else:
+        os.environ["PREFLIGHT_ROOT"] = _prev_pr
+    if _prev_sfr is None:
+        os.environ.pop("SANDBOX_FIRST_ROOT", None)
+    else:
+        os.environ["SANDBOX_FIRST_ROOT"] = _prev_sfr
+bump("37")
+
 # --- cleanup de temporales grandes (opcional, no destructivo) ---
 for d in (ws, ws_sym, ws_ok, ws_ft, ws_e, ws_fp, ws_fp2, ws_out, ws_in, ws_sec, ws_env, ws_big,
-          ws_hon, ws_tmp, ws_ov, ws_life, ws_vict):
+          ws_hon, ws_tmp, ws_ov, ws_life, ws_vict, ws_vic35, ws_att35, ws_b236):
     shutil.rmtree(d, ignore_errors=True)
 
 print(f"\nTODO PASS ✔ ({pass_count} PASS)")

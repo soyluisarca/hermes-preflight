@@ -9,7 +9,7 @@ a misfired `rm -rf`, a migration or a script never touches your data by accident
 > One-line design: **the agent SEES the copy, EXECUTES on the copy, and APPLIES
 > with your approval.**
 
-Status: `v0.1.0` · plugin `validated` · standalone sandbox test `36/36 passing` ·
+Status: `v0.1.0` · plugin `validated` · standalone sandbox test `47/47 passing` ·
 runs on `linux` and `macos`.
 
 ## Quickstart
@@ -101,10 +101,16 @@ applying.
   per file) and that the copy contains no symlink escaping the sandbox root;
   deletions are applied explicitly and only for paths gone from the copy.
   `apply` needs **human confirmation on an interactive terminal** — `--yes` is
-  honored only when stdin is a TTY. This check is **best-effort**: a determined
-  agent that allocates a pty (`python3 -c "import pty"`, `script`, `ssh -tt`)
-  can self-approve. It stops accidental non-TTY approvals, not a determined
-  local agent.
+  honored only when stdin is a TTY. The sandboxed command never inherits your
+  stdin (`stdin=subprocess.DEVNULL`, as in Hermes' local backend), so in the
+  interactive CLI an agent's `sandboxctl apply … --yes` sees a non-TTY stdin
+  and is refused. This check is still **best-effort**: a determined
+  agent that allocates its own pty (`python3 -c "import pty"`, `script`,
+  `ssh -tt`) inside the sandbox can self-approve. It stops accidental
+  non-TTY approvals, not a determined local agent.
+- `apply` also refuses a dangerous target recorded in `<id>/original`: your
+  home, the Hermes home, `~/.ssh` / `~/.aws` / `~/.gnupg`, `/etc` and `/var`
+  (same list the backend uses to refuse a clone), checked before any rsync.
 
 ## Security guards (best-effort)
 
@@ -194,16 +200,30 @@ are by name, not in the abstract:
   that executes code from inside a file. The line of command is scanned; the
   file it runs is not.
 - **The staging root is NOT a trust boundary.** Sandboxes of different
-  sessions live under one root (`<derived or override root>/<id>/…`), and the
-  sandboxed agent receives `$PREFLIGHT_ROOT` pointing at that root. From
-  inside a copy an agent can therefore **read or overwrite another session's
-  registration record** (e.g. `$PREFLIGHT_ROOT/victim/original`) and the
-  fingerprint file (`$PREFLIGHT_ROOT/victim/original.fingerprint`, which is
-  writable). The guards block the obvious literal/expanded forms, but the
-  staging area is a shared workspace, not a fortress: the real protection is
-  the **human TTY confirmation on `apply`/`discard`** (best-effort, as stated)
-  plus the fact that a tampered session still cannot change *your* decision to
-  apply it or not.
+  sessions live under one root (`<derived or override root>/<id>/…`). The
+  agent is not handed that root: `PREFLIGHT_ROOT` / `SANDBOX_FIRST_ROOT` are
+  not exported to the sandboxed command, and are stripped from its environment
+  even when a parent process still sets them (ronda 4). It can still **derive**
+  it: the copy's cwd is `<root>/<id>/workspace` (`pwd`), and `$TMPDIR` is
+  pinned to `<root>/<id>/workspace/.preflight-tmp`, so `echo $TMPDIR` names the
+  root too (`$TMPDIR/../..`). The string `$TMPDIR/../..` is rejected by the
+  guards, and so is a **literal** path to that root (absolute like
+  `cat <root>/victim/original`, or relative like `cat ../../victim/original`):
+  the guards block literal paths outside the copy. Only a **script** run from
+  the copy reaches another session's records freely. That is how an agent can
+  **read or overwrite another session's
+  registration record** (e.g. `<root>/victim/original`, the path the older docs
+  called `$PREFLIGHT_ROOT/victim/original`) and the fingerprint file
+  (`<root>/victim/original.fingerprint`, which is writable) — the
+  documented gap, not a kernel sandbox. A tampered record can then point
+  `apply` at any non-dangerous target; `apply` refuses dangerous ones (home,
+  Hermes home, credential stores, `/etc`, `/var`, same list as the backend's
+  `_reject_forbidden_original`) before any rsync. `discard` never reads that
+  record — it only removes `<root>/<id>`, so a session with a tampered record
+  can always be discarded (apply is the only command the record gates). The
+  real protection remains
+  the **human TTY confirmation on `apply`/`discard`** (best-effort, as
+  stated). A real kernel sandbox (bubblewrap/nsjail) is future work.
 - **The copy is not a boundary against the agent**: a relative `../` path can
   reach outside it (the guards resolve paths against the copy's cwd and reject
   the obvious escapes, but a determined command string can still evade — the
@@ -261,9 +281,13 @@ export HERMES_HOME=~/.hermes/profiles/<profile>
 sandboxctl status
 ```
 
-`PREFLIGHT_ROOT` is transport-only: the backend sets it for child scripts, and
-it must equal the effective root (marker or derived), so a sandboxed command
-cannot aim `discard` at another profile's sessions.
+`PREFLIGHT_ROOT` is not exported to sandboxed commands anymore, and is filtered
+out of the child's environment even if an outer process sets it (ronda 4: it
+handed the agent a map of the staging root). That is not the root itself: the
+child still learns it from its cwd or `$TMPDIR` (see "Honest limitations"). The
+variable is still accepted as transport for scripts/tests that invoke
+`sandboxctl` themselves, and when set it must equal the effective root (marker
+or derived), so it cannot aim `discard` at another profile's sessions.
 
 ## Files
 
@@ -281,7 +305,7 @@ cannot aim `discard` at another profile's sessions.
 ## Quick verification
 
 ```bash
-python3 tests/_test_sandbox.py   # must end with: TODO PASS ✔ (36 PASS)
+python3 tests/_test_sandbox.py   # must end with: TODO PASS ✔ (47 PASS)
 python3 tests/_probe_leak.py     # must end with: TODO OK: sin fugas
 python3 tests/_poc_evidence.py   # demos the audited PoCs are mitigated
 hermes plugins validate ~/.hermes/plugins/preflight   # Validation passed, security scan safe

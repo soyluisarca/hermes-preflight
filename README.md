@@ -66,25 +66,43 @@ Only in /real/ws: credentials/db-password.txt
 The raw diff above is the *detail*. What you actually decide from is the
 **review**: one line per changed file, with the kind of change, printed
 **before** the technical diff by both `sandboxctl apply` and
-`sandboxctl summary <id>`. Real output, same session, git and non-git:
+`sandboxctl summary <id>`. Real output from the same scripted session in both
+kinds of workspace — same initial tree (`src/app.py`, `docs/guide.md`,
+`keepme.txt`, `src/s.sh` mode 755), same four commands (`sed -i 's/^b/B/'
+src/app.py`, `echo new > docs/NEW.md`, `rm keepme.txt`, `chmod 600 src/s.sh`):
 
 ```
 $ sandboxctl summary f1g            # workspace is a git repo
 📋 Cambios pendientes en 'f1g'  (4 archivos: +1 ~2 -1 🔒1)
-   ✏️ src/app.py          2 líneas cambiadas
-   ✏️ src/s.sh            cambiado
-   ➕ docs/NEW.md         nuevo
-   🔒 src/s.sh            permisos 755 → 600
-   ❌ keepme.txt          BORRADO
+   ✏️ src/app.py   2 líneas cambiadas
+   ✏️ src/s.sh     cambiado
+   ➕ docs/NEW.md  nuevo
+   🔒 src/s.sh     permisos 755 → 600
+   ❌ keepme.txt   BORRADO
 
-$ sandboxctl summary f1n            # same script, no git in the workspace
+$ sandboxctl summary f1n            # same script, no .git in the workspace
 📋 Cambios pendientes en 'f1n'  (4 archivos: +1 ~1 -1 🔒1)
-   ✏️ src/app.py          2 líneas cambiadas
-   ✏️ src/newfile.txt     cambiado (tamaño/fecha)
-   ➕ docs/NEW.md         nuevo
-   🔒 src/s.sh            permisos 755 → 600
-   ❌ keepme.txt          BORRADO
+   ✏️ src/app.py   2 líneas cambiadas
+   ➕ docs/NEW.md  nuevo
+   🔒 src/s.sh     permisos 755 → 600
+   ❌ keepme.txt   BORRADO
 ```
+
+The one real difference between the two shows up when a permission change hits
+a file whose *content* did not change. On the git route `git diff --no-index`
+renders that as a header-only hunk:
+
+```
+diff --git a/<real>/src/s.sh b/<copy>/src/s.sh
+old mode 100755
+new mode 100644
+```
+
+The hunk has no `+`/`-` line, the summary counts 0 changed lines, and the file
+is listed as `✏️ ... cambiado` (the `🔒` row already carries the `755 → 600`).
+`diff -ruN` on the non-git route has no mode metadata at all, so the same file
+is silent there and only the `🔒` row reports it — hence `~2` vs `~1`. The file
+is counted once in the header either way (`4 archivos`).
 
 Why it matters:
 
@@ -94,9 +112,16 @@ Why it matters:
   removed file is a `❌ BORRADO` row, not silence.
 - **Permissions are visible** (F1/H5). `chmod` produces no diff line at all;
   the review prints `permisos 755 → 600` (from `rsync -ani`'s mode flag).
-- **Both backends agree** (F1/R1). The summary is built by ONE function from
-  the same tree diff + the same `rsync` dry run that `apply` uses, so a git
-  workspace and a plain directory report the same changes; the two can't drift.
+- **One generator, two backends, one known gap** (F1/R1). The summary is built
+  by ONE function (`build_review_summary`) for both backends, from the same
+  tree diff plus the same `rsync -ani` dry run `apply` uses. What differs is
+  only what each tree-diff backend can *see*: `git diff --no-index` also
+  reports mode-only changes as an empty `✏️ ... cambiado` row, while
+  `diff -ruN` has no mode information and does not. Everything a decision
+  depends on — which files change, created, deleted, and every permission
+  change — is the same on both routes, and the `🔒` row covers the mode change
+  in both. The summary is a view only: `apply` syncs the copy and never reads
+  it, so this cosmetic row cannot change what gets applied.
 - **The diff no longer diffs itself** (F1/H1). `PENDING.diff` lives inside the
   copy, so with git the body used to include the *previous* `PENDING.diff`: after
   N commands the review grew with its whole history (~27 KB after ten trivial

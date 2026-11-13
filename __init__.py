@@ -546,7 +546,11 @@ def build_review_summary(original: Path, sandbox: Path, *, label: str | None = N
             rows.append(("➕", rel, "nuevo"))
             continue
         n = stats.get(rel, 0)
-        rows.append(("✏️", rel, f"{n} líneas cambiadas" if n else "cambiado"))
+        if not n:
+            detail = "cambiado"
+        else:
+            detail = "1 línea cambiada" if n == 1 else f"{n} líneas cambiadas"
+        rows.append(("✏️", rel, detail))
     for rel in only_meta:
         if rel in deleted or rel in stats:
             continue

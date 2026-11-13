@@ -1017,9 +1017,15 @@ bump("38")
 # --- 39) F1/R1: resumen humano por archivo, en AMBOS backends ---
 # El resumen es la vista de decisión: una fila por archivo con el TIPO de cambio
 # (editado / nuevo / BORRADO / permisos), y sale ANTES del diff técnico. Se
-# prueba con git y sin git con el MISMO guion, y los dos deben nombrar los
-# mismos cambios (H4 borrado sin git, H5 permisos que el diff de contenido no
-# muestra).
+# prueba con git y sin git con el MISMO guion y se comparan las FILAS REALES,
+# no un needle: (icono, archivo, detalle) exacto y el «+N ~N -N 🔒N» de la
+# cabecera. La divergencia conocida de backends se FIJA aquí, no se ignora:
+#   * `git diff --no-index` (ruta git) reporta un cambio SOLO de modo como un
+#     hunk de cabecera (`old mode 100755` / `new mode 100644`) sin línea +/-, así
+#     que el archivo sale como «✏️ cambiado» (0 líneas);
+#   * `diff -ruN` (ruta sin git) NO ve modos: ese archivo no sale como ✏️.
+#   En ambos casos la fila 🔒 (permisos 755 → 600) y el total de archivos por
+#   nombre son idénticos: la decisión de apply no cambia.
 def _f1_fixture(git: bool, tag: str):
     d = Path(tempfile.mkdtemp(prefix=f"ws-f1{tag}-"))
     (d / "src").mkdir()
@@ -1037,7 +1043,21 @@ def _f1_fixture(git: bool, tag: str):
                        cwd=d, check=True)
     return d
 
-titles39, rows39 = {}, {}
+
+def _f1_parse(rs):
+    """(header_counts, {(icon, path): detail}) de la salida real del resumen."""
+    m = re.search(r"\((\d+) archivos: \+(\d+) ~(\d+) -(\d+)(?: 🔒(\d+))?\)", rs[0])
+    assert m, f"F1/R1: cabecera sin conteos: {rs[0]!r}"
+    counts = tuple(int(g or 0) for g in m.groups())
+    rows = {}
+    for line in rs[1:]:
+        rm = re.match(r"^   (✏️|➕|🔒|❌) +(\S+) {2,}(.+)$", line)
+        if rm:
+            rows[(rm.group(1), rm.group(2))] = rm.group(3).strip()
+    return counts, rows
+
+
+titles39, rows39, parsed39 = {}, {}, {}
 for git in (True, False):
     tag = "g" if git else "n"
     w = _f1_fixture(git, tag)
@@ -1049,6 +1069,8 @@ for git in (True, False):
     rs = e.review_summary()
     text = "\n".join(rs)
     titles39[tag], rows39[tag] = rs[0], text
+    counts, rows = _f1_parse(rs)
+    parsed39[tag] = (counts, rows)
     assert "src/app.py" in text and "2 líneas cambiadas" in text, f"F1/R1 ({tag}) editado: {text}"
     assert "docs/NEW.md" in text and "nuevo" in text, f"F1/R1 ({tag}) nuevo: {text}"
     assert "keepme.txt" in text and "BORRADO" in text, f"F1/R1 ({tag}) borrado (H4): {text}"
@@ -1063,12 +1085,50 @@ for git in (True, False):
     print(f"  (F1 {tag}) {titles39[tag].strip()}")
     shutil.rmtree(w, ignore_errors=True)
 
-# Backends unificados: el resumen con git y sin git coincide en las filas clave
-for needle in ("src/app.py", "docs/NEW.md", "keepme.txt", "src/s.sh", "BORRADO", "permisos"):
-    assert needle in rows39["g"] and needle in rows39["n"], (
-        f"F1/R1: los backends DISCREPAN en {needle!r} (git={needle in rows39['g']}, "
-        f"nogit={needle in rows39['n']})"
+# 39a) Filas IDÉNTICAS en ambos backends, fila por fila (icono, archivo, detalle).
+# Cada backend se compara contra el contrato EXACTO de lo que el código emite.
+F1_EXPECTED_COMMON = {
+    ("✏️", "src/app.py"): "2 líneas cambiadas",
+    ("➕", "docs/NEW.md"): "nuevo",
+    ("🔒", "src/s.sh"): "permisos 755 → 600",
+    ("❌", "keepme.txt"): "BORRADO",
+}
+F1_EXPECTED_GIT_ONLY = {("✏️", "src/s.sh"): "cambiado"}   # modo solo: git lo ve, diff -ruN no
+F1_CONTRACT = {
+    "g": ((4, 1, 2, 1, 1), {**F1_EXPECTED_COMMON, **F1_EXPECTED_GIT_ONLY}),
+    "n": ((4, 1, 1, 1, 1), dict(F1_EXPECTED_COMMON)),
+}
+for tag, (exp_counts, expected) in F1_CONTRACT.items():
+    counts, rows = parsed39[tag]
+    assert counts == exp_counts, f"F1/R1 ({tag}): cabecera {counts} != contrato {exp_counts}"
+    assert rows == expected, (
+        f"F1/R1 ({tag}): filas {sorted(rows.items())} != contrato {sorted(expected.items())}"
     )
+
+# 39b) La divergencia está FIJADA y es exactamente una fila ✏️ (0 líneas) más:
+# el archivo con permiso cambiado de solo modo. El set de (icono, archivo, detalle)
+# de git menos el de no-git debe ser EXACTAMENTE eso, ni más ni menos.
+only_git = set(parsed39["g"][1].items()) - set(parsed39["n"][1].items())
+only_nogit = set(parsed39["n"][1].items()) - set(parsed39["g"][1].items())
+assert only_git == set(F1_EXPECTED_GIT_ONLY.items()), (
+    f"F1/R1: divergencia git→no-git no documentada: {sorted(only_git)}"
+)
+assert not only_nogit, f"F1/R1: el backend sin git añade filas que el README no declara: {sorted(only_nogit)}"
+# Y la fila que no aparece sin git NO es un cambio de contenido: su detalle no
+# lleva conteo de líneas, la 🔒 fila lleva el dato real.
+assert "línea" not in F1_EXPECTED_GIT_ONLY[("✏️", "src/s.sh")], (
+    "F1/R1: la fila solo-git debe ser UX de modo, no un conteo de líneas"
+)
+# La decisión de apply (archivos por nombre) no diverge: misma clave de archivo.
+files_g = {p for (_, p) in parsed39["g"][1]}
+files_n = {p for (_, p) in parsed39["n"][1]}
+assert files_g == files_n, f"F1/R1: los backends listan archivos distintos: {files_g} vs {files_n}"
+
+# 39c) Y si de verdad divergieran, el test FALLA: un backend que pierda/gane una
+# fila del set común rompe el == de las listas completas (no un `in` laxo).
+for tag in ("g", "n"):
+    _c, r = parsed39[tag]
+    assert set(r) >= set(F1_EXPECTED_COMMON), f"F1/R1 ({tag}): falta una fila común: {sorted(r)}"
 bump("39")
 
 # --- 40) F1/H9: el mensaje trae el comando exacto de aprobación ---

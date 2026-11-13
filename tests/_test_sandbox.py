@@ -982,6 +982,141 @@ finally:
         os.environ["SANDBOX_FIRST_ROOT"] = _prev_sfr
 bump("37")
 
+# === Ronda F1: revisión legible ===========================================
+# --- 38) F1/H1: PENDING.diff NO se diffea contra sí mismo (ruta git) ---
+# Con git, el body salía de `git diff --no-index ORIG COPY` y PENDING.diff vive
+# DENTRO de la copia: tras N comandos el diff incluía el diff anterior entero y
+# crecía cuadráticamente. Ahora se elimina esa sección del body (misma regla que
+# el `-x PENDING.diff` del fallback), así que el tamaño depende de los cambios
+# reales, no del número de revisiones.
+ws38 = Path(tempfile.mkdtemp(prefix="ws-f1h1-"))
+(ws38 / "app.py").write_text("line0\nline1\nline2\n", encoding="utf-8")
+subprocess.run(["git", "init", "-q"], cwd=ws38, check=True)
+subprocess.run(["git", "add", "-A"], cwd=ws38, check=True)
+subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"],
+               cwd=ws38, check=True)
+env38 = provider.create_environment(cwd=str(ws38), timeout=20, task_id="f1h1")
+sizes38 = []
+for i in range(6):
+    r = env38.execute(f"echo 'x{i}' >> note{i}.txt")
+    assert r["exit_code"] == 0, f"F1/H1: comando {i} falló: {r['output']!r}"
+    sizes38.append((env38.sandbox_path / "PENDING.diff").stat().st_size)
+body38 = (env38.sandbox_path / "PENDING.diff").read_text(encoding="utf-8")
+# El cuerpo del diff no lista PENDING.diff como archivo cambiado y su tamaño no
+# explota con el nº de revisiones.
+assert "diff --git" in body38 or "diff -ruN" in body38, f"F1/H1: sin diff en el body: {body38[:300]!r}"
+assert "PENDING.diff" not in [l for l in body38.splitlines() if l.startswith(("diff --git", "diff -ruN"))], (
+    "F1/H1: PENDING.diff sigue diffeándose a sí mismo"
+)
+assert sizes38[-1] - sizes38[1] < 4096, (
+    f"F1/H1: PENDING.diff crece con el nº de revisiones (self-diff): {sizes38}"
+)
+print(f"  (H1) tamaños tras cada comando: {sizes38}")
+bump("38")
+
+# --- 39) F1/R1: resumen humano por archivo, en AMBOS backends ---
+# El resumen es la vista de decisión: una fila por archivo con el TIPO de cambio
+# (editado / nuevo / BORRADO / permisos), y sale ANTES del diff técnico. Se
+# prueba con git y sin git con el MISMO guion, y los dos deben nombrar los
+# mismos cambios (H4 borrado sin git, H5 permisos que el diff de contenido no
+# muestra).
+def _f1_fixture(git: bool, tag: str):
+    d = Path(tempfile.mkdtemp(prefix=f"ws-f1{tag}-"))
+    (d / "src").mkdir()
+    (d / "docs").mkdir()
+    (d / "src" / "app.py").write_text("a\nb\nc\n", encoding="utf-8")
+    (d / "docs" / "guide.md").write_text("old\n", encoding="utf-8")
+    (d / "keepme.txt").write_text("bye\n", encoding="utf-8")
+    sh = d / "src" / "s.sh"
+    sh.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    sh.chmod(0o755)
+    if git:
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=d, check=True)
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"],
+                       cwd=d, check=True)
+    return d
+
+titles39, rows39 = {}, {}
+for git in (True, False):
+    tag = "g" if git else "n"
+    w = _f1_fixture(git, tag)
+    e = provider.create_environment(cwd=str(w), timeout=20, task_id=f"f1{tag}")
+    for c in ("sed -i 's/^b/B/' src/app.py", "echo new > docs/NEW.md",
+              "rm keepme.txt", "chmod 600 src/s.sh"):
+        rr = e.execute(c)
+        assert rr["exit_code"] == 0, f"F1/R1 ({tag}): '{c}' falló: {rr['output']!r}"
+    rs = e.review_summary()
+    text = "\n".join(rs)
+    titles39[tag], rows39[tag] = rs[0], text
+    assert "src/app.py" in text and "2 líneas cambiadas" in text, f"F1/R1 ({tag}) editado: {text}"
+    assert "docs/NEW.md" in text and "nuevo" in text, f"F1/R1 ({tag}) nuevo: {text}"
+    assert "keepme.txt" in text and "BORRADO" in text, f"F1/R1 ({tag}) borrado (H4): {text}"
+    assert "src/s.sh" in text and "permisos" in text and "755" in text and "600" in text, (
+        f"F1/R1 ({tag}) permisos (H5): {text}"
+    )
+    assert "PENDING.diff" not in text, f"F1/R1 ({tag}): el resumen menciona PENDING.diff: {text}"
+    assert ".preflight-tmp" not in text, (
+        f"F1/R1 ({tag}): el TMPDIR pinneado aparece en el resumen (no se aplica): {text}"
+    )
+    assert "Cambios pendientes" in titles39[tag], f"F1/R1 ({tag}) cabecera: {titles39[tag]!r}"
+    print(f"  (F1 {tag}) {titles39[tag].strip()}")
+    shutil.rmtree(w, ignore_errors=True)
+
+# Backends unificados: el resumen con git y sin git coincide en las filas clave
+for needle in ("src/app.py", "docs/NEW.md", "keepme.txt", "src/s.sh", "BORRADO", "permisos"):
+    assert needle in rows39["g"] and needle in rows39["n"], (
+        f"F1/R1: los backends DISCREPAN en {needle!r} (git={needle in rows39['g']}, "
+        f"nogit={needle in rows39['n']})"
+    )
+bump("39")
+
+# --- 40) F1/H9: el mensaje trae el comando exacto de aprobación ---
+# `apply` sin TTY no puede preguntar: debe imprimir la línea ejecutable con la
+# task_id real, para que el humano no tenga que adivinarla.
+sess40 = SB_ROOT / "f1h9"
+(sess40 / "workspace").mkdir(parents=True, exist_ok=True)
+(sess40 / "workspace" / "PENDING.diff").write_text("# pending\n", encoding="utf-8")
+(sess40 / "original").write_text(str(ws38), encoding="utf-8")
+(sess40 / "original.fingerprint").write_text("deliberately-not-matching", encoding="utf-8")
+code40 = run_sbctl("apply", "f1h9", "--yes")  # sin TTY: --yes NO vale
+out40 = code40.stdout + code40.stderr
+assert code40.returncode == 2, (
+    f"F1/H9: apply sin TTY devolvió {code40.returncode}, se esperaba 2: {out40[:400]!r}"
+)
+assert "sandboxctl apply f1h9" in out40, f"F1/H9: falta el comando exacto de aprobación: {out40[:400]!r}"
+bump("40")
+
+# --- 41) F1/H9: `status` es descubrible (id, workspace, comandos, comando) ---
+p41 = run_sbctl("status")
+ok41, out41 = p41.returncode, p41.stdout + p41.stderr
+st41 = out41
+assert ok41 == 0, f"status rc={ok41}: {out41[:400]!r}"
+assert "f1g" in st41 or "f1n" in st41 or "f1h1" in st41, f"F1/H9: status no lista las task_id: {st41[:600]!r}"
+assert "sandboxctl apply " in st41, f"F1/H9: status no imprime el comando de aprobación: {st41[:600]!r}"
+assert "workspace" in st41 and "comandos" in st41, f"F1/H9: status no muestra workspace/comandos: {st41[:600]!r}"
+print("  (H9) " + " | ".join(l.strip() for l in st41.splitlines() if "sandboxctl apply" in l)[:200])
+bump("41")
+
+# --- 42) F1/H5: apply imprime el RESUMEN antes del diff técnico ---
+# El orden importa: el humano decide leyendo la lista de archivos; el diff es
+# el detalle. Se verifica sobre la salida real de apply con TTY.
+w42 = _f1_fixture(False, "a")
+e42 = provider.create_environment(cwd=str(w42), timeout=20, task_id="f1a")
+assert e42.execute("echo plus > extra.txt")["exit_code"] == 0
+assert e42.execute("chmod 640 docs/guide.md")["exit_code"] == 0
+code42, out42 = run_sbctl_tty("apply", "f1a", answer="n\n")  # se cancela: solo se mira la vista
+pos_summary = out42.find("Cambios pendientes")
+pos_diff = out42.find("diff técnico")
+assert pos_summary != -1, f"F1/R1: apply no imprime el resumen humano: {out42[:800]!r}"
+assert pos_diff != -1, f"F1/R1: apply no imprime el diff técnico: {out42[:800]!r}"
+assert pos_summary < pos_diff, (
+    f"F1/R1: el diff técnico sale ANTES del resumen (summary@{pos_summary}, diff@{pos_diff})"
+)
+assert "extra.txt" in out42 and "nuevo" in out42, f"F1/R1: el resumen de apply no lista el archivo nuevo: {out42[:800]!r}"
+shutil.rmtree(w42, ignore_errors=True)
+bump("42")
+
 # --- cleanup de temporales grandes (opcional, no destructivo) ---
 for d in (ws, ws_sym, ws_ok, ws_ft, ws_e, ws_fp, ws_fp2, ws_out, ws_in, ws_sec, ws_env, ws_big,
           ws_hon, ws_tmp, ws_ov, ws_life, ws_vict, ws_vic35, ws_att35, ws_b236):

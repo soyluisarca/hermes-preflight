@@ -32,6 +32,35 @@ def _derive_sandroot() -> Path:
     return get_hermes_home() / "sandbox"
 
 
+# Sub-trees of a Hermes home that are NEVER a workspace copy source (F1/H10).
+# Rationale: the whole Hermes home was refused before, which also blocked a
+# legitimate project living under ``~/.hermes/workspace/<proj>``. These
+# entries are the ones whose copy/apply would be actively harmful: the config
+# (secrets: provider keys, OAuth files), the session/state stores that Hermes
+# is writing to right now, the plugin/skill/memory trees the runtime loads,
+# the sandbox staging root (copying the copy), and the large caches.
+# Everything else under the Hermes home is allowed as a workspace — the
+# ``workspace``, ``projects`` and ``vault`` trees are meant for user projects.
+_HERMES_HOME_EXCLUDE = (
+    # runtime config + credentials
+    "config.yaml", "config", "profiles", "profiles.d", "profile.yaml",
+    "auth.json", "auth.lock", "cookies", "tokens",
+    # sessions / live state
+    "sessions", "sessions.db", "state.db", "state", "state-snapshots",
+    "responses", "response_store.db", "recovered-state.db", "terminal-sessions",
+    "checkpoints", "pending", "pending_messages", "processes.json",
+    "processes.json.lock", "runtime", "gateway_state.json", "gateway.sock",
+    "gateway.lock", "gateway.pid", "kanban", "kanban.db", "lcm.db", "memory_store.db",
+    "projects.db", "projects.db.bak", "runs_idempotency.db", "safety",
+    # code / state the runtime loads
+    "plugins", "skills", "memories", "hooks", "hermes-agent", "bin", "scripts",
+    "tools", "lsp", "pairing", "security", "shared", "shared-state.db",
+    # sandbox staging (copying the copy) + caches
+    "sandbox", "sandboxes", "cache", "logs", "image_cache", "audio_cache",
+    "plugin-data", "plugin-update-checks", "install_id", "installs",
+)
+
+
 # Root directory for sandboxes.
 #
 # Derived from the ACTIVE Hermes home (hermes_constants.get_hermes_home()) so
@@ -248,7 +277,11 @@ def _strip_tmpdir(body: str) -> str:
     out: list[str] = []
     skip = False
     for line in body.splitlines():
-        is_file_header = line.startswith(("diff ", "Only in", "Index "))
+        # `diff --git` is the header git emits; without it the git route's
+        # `.preflight-tmp` section never starts (only its body was dropped), so
+        # `---`/`+++` lines leaked back in and the pinned TMPDIR showed up as a
+        # new file in the review.
+        is_file_header = line.startswith(("diff --git ", "diff ", "Only in", "Index "))
         if is_file_header:
             if ".preflight-tmp" in line:
                 skip = True
@@ -258,6 +291,311 @@ def _strip_tmpdir(body: str) -> str:
             continue
         out.append(line)
     return "\n".join(out)
+
+
+# --- human-readable review summary (F1/R1), shared by BOTH diff backends ---
+# The summary is the decision view: one line per changed file with the KIND of
+# change (edited / new / DELETED / permissions) and, at the top, how much of
+# the whole review is visible. It is built from the SAME two sources the diff
+# uses (a real tree diff, plus `rsync --dry-run` itemized output for the
+# metadata rsync -a really applies), so both backends report the same thing:
+# with and without git. It NEVER reads PENDING.diff and apply never reads the
+# summary: redaction stays in the view, applying stays a clean sync.
+_SUMMARY_MAX_FILES = 20  # files listed in full; the rest are counted
+
+
+def _run_tree_diff(original: Path, sandbox: Path) -> str:
+    """Redacted, TMPDIR-filtered tree diff body (``git`` or ``diff -ruN``).
+
+    Single source for the body of ``PENDING.diff`` AND for the summary, so the
+    two can never disagree.
+
+    F1/H1: ``PENDING.diff`` lives INSIDE the copy, so a plain
+    ``git diff --no-index ORIG COPY`` diffs the copy against itself *including*
+    the previously written ``PENDING.diff``: after N commands the review grows
+    by the whole previous review (10 commands -> ~27 KB, 50 -> ~100 KB) and
+    buries the real change. The file is excluded here, on the git route exactly
+    like ``diff -ruN -x PENDING.diff`` does on the fallback route.
+    """
+    if (original / ".git").is_dir():
+        # git diff --no-index treats both paths as independent trees.
+        cmd = (
+            f"git diff --no-index --no-color "
+            f"-- {shlex.quote(str(original))} {shlex.quote(str(sandbox))}"
+        )
+        proc = subprocess.run(
+            ["bash", "-c", cmd], capture_output=True, text=True, stdin=subprocess.DEVNULL
+        )
+        body = _partial_str(proc.stdout) + _partial_str(proc.stderr)
+        body = _drop_pending_diff_hunks(body)
+    else:
+        # diff -ruN: excludes the diff-file's own path (used outside of git).
+        cmd = (
+            f"diff -ruN -x PENDING.diff "
+            f"{shlex.quote(str(original))} {shlex.quote(str(sandbox))}"
+        )
+        proc = subprocess.run(
+            ["bash", "-c", cmd], capture_output=True, text=True, stdin=subprocess.DEVNULL
+        )
+        body = _partial_str(proc.stdout) + _partial_str(proc.stderr)
+    # The diff is the REVIEW VIEW: secret-looking values are redacted here so a
+    # cross-session reader (or a `sandboxctl diff`) never sees them in clear,
+    # and hunks touching the pinned TMPDIR (.preflight-tmp) are dropped so temp
+    # files never pollute the review nor get applied. Apply does NOT read this
+    # for content - it syncs the copy, so redaction cannot change what applies.
+    return _strip_tmpdir(_redact_diff_body(body))
+
+
+def _drop_pending_diff_hunks(body: str) -> str:
+    """Drop every file section belonging to ``PENDING.diff`` from a git diff.
+
+    ``git diff --no-index`` has no exclude option, so the section is removed
+    here: once a ``diff --git`` / ``---`` / ``+++`` header names a path whose
+    basename is ``PENDING.diff``, all following lines up to the next file
+    header are removed (same header rules as ``_strip_tmpdir``, plus the
+    ``diff --git`` line git emits).
+    """
+    out: list[str] = []
+    skip = False
+    for line in body.splitlines():
+        if line.startswith(("diff --git ", "diff ", "Only in ", "Index ")):
+            names_pending = any(
+                part.rstrip("/").endswith("PENDING.diff") or part == "PENDING.diff"
+                for part in line.split()
+            )
+            skip = names_pending
+            if skip:
+                continue
+        if not skip and line.startswith(("--- ", "+++ ")):
+            if line.split()[1:] and line.split()[1].rstrip("\t").endswith("PENDING.diff"):
+                skip = True
+                continue
+        if skip:
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _rsync_metadata(original: Path, sandbox: Path) -> list[tuple[str, str]]:
+    """``(relpath, itemize_code)`` pairs from ``rsync -ani`` (dry run).
+
+    This is the REAL source of truth for what an apply would change beyond the
+    text diff: rsync -a copies modes, and deletions only show up as
+    ``*deleting`` items. ``-a`` (no ``-c``) compares size+mtime so an untouched
+    file stays silent and the output is cheap. Same excludes as apply.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "rsync", "-ani", "--delete",
+                "--exclude=PENDING.diff", "--exclude=.preflight-tmp",
+                f"{sandbox}/", f"{original}/",
+            ],
+            capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    items: list[tuple[str, str]] = []
+    for raw in proc.stdout.splitlines():
+        line = raw.rstrip()
+        if not line or line.startswith("sending ") or line.startswith("sent "):
+            continue
+        if line.startswith("*deleting "):
+            # rsync pads the name to the length of "<f+++++++++ <longest-name>"
+            # so an itemized line can look like "*deleting   keepme.txt".
+            items.append((line[len("*deleting "):].lstrip(), "*deleting"))
+            continue
+        # itemized: 11 chars of flags, one space, then the path
+        if len(line) > 12 and line[11:12] == " ":
+            rel = line[12:]
+            if rel in (".", "./") or rel.endswith("/"):
+                continue  # directory entries: mtime-only, "size" is the dir inode
+            items.append((rel, line[:11]))
+    return items
+
+
+def _diff_file_stats(body: str, original: Path, sandbox: Path) -> dict[str, int]:
+    """``{relpath: changed lines}`` from a tree diff body (both backends).
+
+    ``git diff --no-index`` prints paths as ``a/<orig-path>`` / ``b/<copy-path>``
+    (the leading ``/`` is swallowed, so ``a/home/u/ws/x`` is ``/home/u/ws/x``),
+    ``diff -ruN`` prints the absolute paths bare in ``diff``/``---``/``+++``.
+    Both are normalised to the path RELATIVE to the copy (or to the original
+    for a deleted file) so the summary reads like the workspace the human
+    knows, and a path outside both trees is dropped instead of being guessed.
+    """
+    def rel_of(raw: str) -> str:
+        raw = raw.strip().strip('"')
+        if raw in ("/dev/null", ""):
+            return ""
+        cand = None
+        for base in (sandbox, original):
+            base_s = str(base)
+            for pref in ("a" + base_s, "b" + base_s, base_s):
+                if raw.startswith(pref):
+                    cand = raw[len(pref):].lstrip("/")
+                    break
+            if cand is not None:
+                break
+        if cand is None:
+            # Unknown layout: keep the path as printed (never invent a tree).
+            cand = raw.lstrip("/")
+        return cand
+
+    stats: dict[str, int] = {}
+    current: str | None = None
+    for line in body.splitlines():
+        if line.startswith(("diff --git ", "diff -ruN ", "diff -u ")):
+            parts = line.split()
+            rel = rel_of(parts[-1]) if parts else ""
+            current = rel or None
+            if current:
+                stats.setdefault(current, 0)
+            continue
+        if line.startswith("+++ "):
+            parts = line.split("\t")[0].split()
+            rel = rel_of(parts[1]) if len(parts) > 1 else ""
+            if rel:  # /dev/null keeps the path from the diff/--- header
+                current = rel
+                stats.setdefault(current, 0)
+            continue
+        if line.startswith("--- "):
+            parts = line.split("\t")[0].split()
+            rel = rel_of(parts[1]) if len(parts) > 1 else ""
+            if rel and current is None:
+                current = rel
+                stats.setdefault(current, 0)
+            continue
+        if line.startswith(("@@", "Only in ", "Index ", "\\ No newline")):
+            continue
+        if current and line[:1] in ("+", "-") and not line.startswith(("+++", "---")):
+            stats[current] = stats.get(current, 0) + 1
+    return stats
+
+
+def build_review_summary(original: Path, sandbox: Path, *, label: str | None = None) -> list[str]:
+    """Human-readable review: one compact block a non-technical person can read.
+
+    Production of the two real sources:
+      * tree diff (git or diff -ruN) -> edited files + changed line counts, and
+        created/deleted files (``+++ /dev/null`` / ``Only in ORIG``);
+      * ``rsync -ani`` dry run          -> ``*deleting`` (authoritative: also
+        works WITHOUT git) and permission/type flags (``.f...p.....``).
+
+    Returns the lines (no trailing newline) to print BEFORE the technical diff.
+    Honest by construction: a kind it cannot classify is listed as ``?``; the
+    header states when the list is truncated.
+    """
+    name = label or sandbox.name
+    body = _run_tree_diff(original, sandbox)
+    stats = _diff_file_stats(body, original, sandbox)
+    meta = _rsync_metadata(original, sandbox)
+
+    deleted: dict[str, None] = {}
+    perms: dict[str, str] = {}
+    only_meta: dict[str, str] = {}
+    for rel, code in meta:
+        rel = rel[2:] if rel.startswith("./") else rel  # rsync root marker
+        if rel == ".preflight-tmp" or rel.startswith(".preflight-tmp/"):
+            continue  # pinned TMPDIR: never applied, so never in the review
+        if code == "*deleting":
+            deleted[rel.rstrip("/")] = None
+            continue
+        if "p" in code:  # permissions differ
+            perms[rel] = code
+            continue
+        # rsync -ani reports every name it would transfer (including files the
+        # diff already lists); it is only ADDITIONAL here when the text diff did
+        # not name it (size/type change with no changed line).
+        if rel not in stats and rel not in perms and rel not in deleted:
+            only_meta[rel] = code
+
+    # Deleted files also come from the tree diff for both backends, so a
+    # deletion is listed even if `rsync` is unavailable.
+    for rel in stats:
+        try:
+            if not (sandbox / rel).exists():
+                deleted[rel] = None
+        except OSError:
+            pass
+    # A file the text diff did not name but the copy no longer has (a mode-only
+    # change that `rsync -a` also flags as a deletion candidate) is a deletion.
+    for rel in list(only_meta):
+        try:
+            if not (sandbox / rel).exists():
+                deleted[rel] = None
+                only_meta.pop(rel, None)
+        except OSError:
+            pass
+
+    # One row per real path. A deletion reported twice (rsync on one route,
+    # tree diff on the other) collapses to the rsync name.
+    if deleted:
+        _del_sorted = sorted(deleted, key=lambda r: (r.count("/"), r))
+        for rel in list(_del_sorted):
+            for other in _del_sorted:
+                if other != rel and other.endswith("/" + rel) and other in deleted and rel in deleted:
+                    deleted.pop(rel, None)
+                    break
+
+    rows: list[tuple[str, str, str]] = []  # (icon, path, detail)
+    for rel in sorted(stats):
+        if rel in deleted:
+            continue
+        if not (original / rel).exists():
+            rows.append(("➕", rel, "nuevo"))
+            continue
+        n = stats.get(rel, 0)
+        rows.append(("✏️", rel, f"{n} líneas cambiadas" if n else "cambiado"))
+    for rel in only_meta:
+        if rel in deleted or rel in stats:
+            continue
+        rows.append(("✏️", rel, "cambiado (tamaño/fecha)"))
+    for rel in perms:
+        rows.append(("🔒", rel, _describe_mode_change(original, sandbox, rel)))
+    for rel in deleted:
+        rows.append(("❌", rel, "BORRADO"))
+
+    # Stable order: created/edited, permissions, deletions last (so a deletion
+    # never hides behind the fold).
+    order = {"✏️": 0, "➕": 1, "🔒": 2, "❌": 3}
+    rows.sort(key=lambda r: (order.get(r[0], 9), r[1]))
+    n_new = sum(1 for r in rows if r[0] == "➕")
+    n_edit = sum(1 for r in rows if r[0] == "✏️")
+    n_del = sum(1 for r in rows if r[0] == "❌")
+    n_perm = sum(1 for r in rows if r[0] == "🔒")
+    # A file can be both edited and re-permissioned: count each file once.
+    total = len({r[1] for r in rows})
+
+    width = max([len(r[1]) for r in rows] + [8])
+    lines = [
+        f"📋 Cambios pendientes en '{name}'  ({total} archivos: "
+        f"+{n_new} ~{n_edit} -{n_del}" + (f" 🔒{n_perm}" if n_perm else "") + ")",
+    ]
+    if not rows:
+        lines.append("   (sin cambios respecto al workspace real)")
+    for icon, rel, detail in rows[:_SUMMARY_MAX_FILES]:
+        lines.append(f"   {icon} {rel:<{width}}  {detail}")
+    if total > _SUMMARY_MAX_FILES:
+        lines.append(
+            f"   … y {total - _SUMMARY_MAX_FILES} archivos más "
+            f"(ver el diff completo para la lista entera)"
+        )
+    return lines
+
+
+def _describe_mode_change(original: Path, sandbox: Path, rel: str) -> str:
+    """``permisos 755 → 600`` for a permission-only change."""
+    def mode_of(base: Path):
+        try:
+            return oct(base.joinpath(rel).stat().st_mode & 0o777)[2:]
+        except OSError:
+            return None
+
+    before, after = mode_of(original), mode_of(sandbox)
+    if before and after and before != after:
+        return f"permisos {before} → {after}"
+    return "permisos (cambiados)"
 
 
 def _write_original_fingerprint(original: Path, dst: Path) -> None:
@@ -646,15 +984,45 @@ class PreflightEnvironment:
 
         # 4) Accumulated diff after each command.
         try:
+            self._bump_command_count()
+        except Exception:
+            pass  # cosmetic session metadata; never breaks execution
+        try:
             self._write_pending_diff()
         except Exception as e:  # the diff must never break execution
             result["output"] += f"\n[warning: could not write PENDING.diff: {e}]"
         return result
 
+    def _bump_command_count(self):
+        """Count executed commands inside the pinned TMPDIR (session metadata).
+
+        ``sandboxctl status`` shows "N comandos" so the human can tell an
+        untouched copy from a busy one. Lives under ``.preflight-tmp`` so it is
+        never applied and never shows up in the review (F1). Deliberately a
+        best-effort counter: a sandboxed command can edit it, and that is fine —
+        it is a hint, not a guarantee.
+        """
+        tmp = self.sandbox_path / ".preflight-tmp"
+        tmp.mkdir(exist_ok=True)
+        marker = tmp / ".cmd-count"
+        try:
+            n = int(marker.read_text().strip() or "0")
+        except (OSError, ValueError):
+            n = 0
+        marker.write_text(f"{n + 1}\n")
+
     # --- accumulated diff ---
     def _diff_command(self):
+        """The tree-diff command for the current route (kept for diagnostics).
+
+        The real work happens in ``_run_tree_diff``; this returns the equivalent
+        shell line so the route is greppable/inspectable and the fallback keeps
+        its ``-x PENDING.diff`` exclusion.
+        """
         if (self.original_path / ".git").is_dir():
-            # git diff --no-index treats both paths as independent trees.
+            # git diff --no-index treats both paths as independent trees. The
+            # PENDING.diff section is removed from the body (see
+            # _drop_pending_diff_hunks): F1/H1, the same rule as the fallback.
             return (
                 f"git diff --no-index --no-color "
                 f"-- {shlex.quote(str(self.original_path))} {shlex.quote(str(self.sandbox_path))}"
@@ -665,10 +1033,16 @@ class PreflightEnvironment:
             f"{shlex.quote(str(self.original_path))} {shlex.quote(str(self.sandbox_path))}"
         )
 
+    def review_summary(self) -> list[str]:
+        """The human-readable review block (same generator as sandboxctl apply)."""
+        return build_review_summary(
+            self.original_path, self.sandbox_path, label=self.sandbox_path.name
+        )
+
     def _write_pending_diff(self):
-        cmd = self._diff_command()
-        proc = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
-        body = _partial_str(proc.stdout) + _partial_str(proc.stderr)
+        # One shared implementation for BOTH routes: the body is redacted,
+        # TMPDIR-filtered and (git route) free of its own PENDING.diff section.
+        body = _run_tree_diff(self.original_path, self.sandbox_path)
         # diff exits rc != 0 when there are differences (normal). Not an error.
         header = (
             f"# PENDING.diff — preflight ({self.sandbox_path.name})\n"
@@ -676,18 +1050,18 @@ class PreflightEnvironment:
             f"# SANDBOX  : {self.sandbox_path}\n"
             f"# # Accumulated after the last executed command.\n"
             f"# Nothing has been applied to the real workspace yet.\n"
-            f"# To apply: sandboxctl apply {self.sandbox_path.name}\n"
+            f"# Summary (what a human reads first):\n"
+        )
+        for line in build_review_summary(
+            self.original_path, self.sandbox_path, label=self.sandbox_path.name
+        ):
+            header += f"#   {line}\n"
+        header += (
+            f"# To apply ALL: sandboxctl apply {self.sandbox_path.name}\n"
+            f"# To see this diff: sandboxctl diff {self.sandbox_path.name}\n"
             f"# To discard: sandboxctl discard {self.sandbox_path.name}\n\n"
         )
-        # The diff is the REVIEW VIEW: secret-looking values are redacted here
-        # so a cross-session reader (or a `sandboxctl diff`) never sees them in
-        # clear, and hunks touching the pinned TMPDIR (.preflight-tmp) are
-        # dropped so temp files never pollute the review nor get applied.
-        # Apply does NOT read this file for content — it syncs the copy, so
-        # redaction cannot change what is applied.
-        self._pending.write_text(
-            header + _strip_tmpdir(_redact_diff_body(body)), encoding="utf-8"
-        )
+        self._pending.write_text(header + body, encoding="utf-8")
 
     def cleanup(self):
         """Leave the sandbox intact (no delete). Discard is explicit (discard)."""
@@ -828,8 +1202,8 @@ class PreflightProvider(TerminalEnvironmentProvider):
         )
 
     def _reject_forbidden_original(self, original: Path) -> Path:
-        """Refuse to clone the user's home / Hermes home, sensitive dirs, or a
-        path that contains the sandbox root; return the canonical resolved path.
+        """Refuse to clone the user's home / Hermes config+sessions / sensitive
+        dirs, or a path that contains the sandbox root; return the canonical path.
 
         ``cp -a ~/.hermes/sandbox/... ~/`` would copy the copy onto itself,
         the copytree fallback recurses until the disk fills, and every secret
@@ -838,6 +1212,16 @@ class PreflightProvider(TerminalEnvironmentProvider):
         system directories (/etc, /var): cloning them snapshots secrets or
         explodes the tree. Raise a clear error asking the user to ``cd`` into a
         project directory instead.
+
+        F1/H10: the Hermes home itself is still refused, but a PROJECT inside
+        it is a legitimate workspace (``~/.hermes/workspace/<proj>``,
+        ``~/.hermes/projects/<proj>``). The exclusion is name-precise: only the
+        subtrees in ``_HERMES_HOME_EXCLUDE`` (config, credentials, sessions and
+        live state, plugins/skills/memories, sandbox staging, caches) and the
+        profile homes stay refused. Any path that merely CONTAINS the Hermes
+        home (``~/``, its parents) is refused as before, and a symlinked
+        ``workspace`` entry that resolves into an excluded subtree is caught
+        because the test runs on the RESOLVED path.
         """
         try:
             orig_res = original.resolve()
@@ -852,6 +1236,7 @@ class PreflightProvider(TerminalEnvironmentProvider):
             hh = hermes_constants.get_hermes_home().resolve()
             hermes_homes.add(hh)
             hermes_homes.add(hh.parent)  # convenience: ~/.hermes == home of home
+            hermes_homes.add(hh.parent / "profiles")
         except Exception:
             pass
 
@@ -872,13 +1257,30 @@ class PreflightProvider(TerminalEnvironmentProvider):
         elif any(orig_res == h for h in hermes_homes):
             bad = True
             reason = f"refusing to clone the Hermes home directory ({orig_res})"
-        elif any(orig_res == s or under(orig_res, s) for s in sensitive_home):
+        else:
+            # F1/H10: a project INSIDE a Hermes home is allowed unless it
+            # resolves into one of the excluded (config/sessions/runtime) trees.
+            for hh in hermes_homes:
+                if not under(orig_res, hh) or orig_res == hh:
+                    continue
+                try:
+                    rel = orig_res.relative_to(hh)
+                except ValueError:
+                    continue
+                if rel.parts and rel.parts[0] in _HERMES_HOME_EXCLUDE:
+                    bad = True
+                    reason = (
+                        f"refusing to clone a Hermes config/session tree "
+                        f"({orig_res}; exclude ~/.hermes/{rel.parts[0]})"
+                    )
+                    break
+        if not bad and any(orig_res == s or under(orig_res, s) for s in sensitive_home):
             bad = True
             reason = f"refusing to clone a sensitive directory under your home ({orig_res})"
-        elif any(orig_res == s or under(orig_res, s) for s in system_roots):
+        if not bad and any(orig_res == s or under(orig_res, s) for s in system_roots):
             bad = True
             reason = f"refusing to clone a system directory ({orig_res})"
-        elif sand_root and (under(orig_res, sand_root) or under(sand_root, orig_res)):
+        if not bad and sand_root and (under(orig_res, sand_root) or under(sand_root, orig_res)):
             bad = True
             reason = (
                 f"refusing to clone a path that overlaps the sandbox root "

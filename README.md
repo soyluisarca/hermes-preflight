@@ -9,7 +9,7 @@ a misfired `rm -rf`, a migration or a script never touches your data by accident
 > One-line design: **the agent SEES the copy, EXECUTES on the copy, and APPLIES
 > with your approval.**
 
-Status: `v0.1.0` · plugin `validated` · standalone sandbox test `47/47 passing` ·
+Status: `v0.1.0` · plugin `validated` · standalone sandbox test `52/52 passing` ·
 runs on `linux` and `macos`.
 
 ## Quickstart
@@ -56,21 +56,87 @@ diff -ruN -x PENDING.diff /real/ws /sandbox/task-AB12/workspace
 --- /real/ws/src/config.py        2026-11-10 22:46:02.783832625 -0600
 +++ /sandbox/task-AB12/workspace/src/config.py  1969-12-31 18:00:00.000000000 -0600
 @@ -1,2 +1,2 @@
--API_KEY = "sk-REAL-SECRET"
-+API_KEY = "sk-SAFE-SECRET"
+-API_KEY «redacted-secret» "«redacted:sk-…»"
++API_KEY = "«redacted:sk-…»"
 Only in /real/ws: credentials/db-password.txt
 ```
 
-You review it, then decide to `apply` or `discard`.
+## The review comes first (F1)
 
-`apply` approves the **whole pending diff** (the entire workspace copy is
+The raw diff above is the *detail*. What you actually decide from is the
+**review**: one line per changed file, with the kind of change, printed
+**before** the technical diff by both `sandboxctl apply` and
+`sandboxctl summary <id>`. Real output, same session, git and non-git:
+
+```
+$ sandboxctl summary f1g            # workspace is a git repo
+📋 Cambios pendientes en 'f1g'  (4 archivos: +1 ~2 -1 🔒1)
+   ✏️ src/app.py          2 líneas cambiadas
+   ✏️ src/s.sh            cambiado
+   ➕ docs/NEW.md         nuevo
+   🔒 src/s.sh            permisos 755 → 600
+   ❌ keepme.txt          BORRADO
+
+$ sandboxctl summary f1n            # same script, no git in the workspace
+📋 Cambios pendientes en 'f1n'  (4 archivos: +1 ~1 -1 🔒1)
+   ✏️ src/app.py          2 líneas cambiadas
+   ✏️ src/newfile.txt     cambiado (tamaño/fecha)
+   ➕ docs/NEW.md         nuevo
+   🔒 src/s.sh            permisos 755 → 600
+   ❌ keepme.txt          BORRADO
+```
+
+Why it matters:
+
+- **Deletions are visible without git** (F1/H4). `git diff --no-index` cannot
+  express a deletion the copy never had, and a missing file has no lines to
+  show; the review reads the filesystem plus `rsync --dry-run --delete`, so a
+  removed file is a `❌ BORRADO` row, not silence.
+- **Permissions are visible** (F1/H5). `chmod` produces no diff line at all;
+  the review prints `permisos 755 → 600` (from `rsync -ani`'s mode flag).
+- **Both backends agree** (F1/R1). The summary is built by ONE function from
+  the same tree diff + the same `rsync` dry run that `apply` uses, so a git
+  workspace and a plain directory report the same changes; the two can't drift.
+- **The diff no longer diffs itself** (F1/H1). `PENDING.diff` lives inside the
+  copy, so with git the body used to include the *previous* `PENDING.diff`: after
+  N commands the review grew with its whole history (~27 KB after ten trivial
+  commands). That section is now dropped from the body, exactly like the
+  `-x PENDING.diff` the non-git route always had.
+- **The summary is a VIEW.** `apply` never reads it to decide what to copy (it
+  syncs the copy) and the summary never reads `PENDING.diff`. Redaction stays in
+  the view; applying stays a clean sync.
+
+After `apply` the copy is the real workspace; the review is recomputed from
+disk each time. You review it, then decide to `apply` or `discard`.
+
+`apply` approves the **whole pending change set** (the entire workspace copy is
 synced into the real workspace via `rsync -a` plus explicit deletions, no
-global `--delete`) — it does **not** offer per-file selection. `PENDING.diff`
-is the review gate for **content**: it shows what text/files change. It is NOT
-a byte-exact preview — mtimes, permissions and other metadata can change (or
-whole files be synced) without appearing as diff lines. If you want only some
-of the changes, edit the copy (or discard and start a focused session) before
-applying.
+global `--delete`) — it does **not** offer per-file selection. The review is
+the review gate for **content and obvious metadata**, but it is NOT a
+byte-exact preview — mtimes and other metadata can still change (or whole files
+be synced) without appearing as a diff line. If you want only some of the
+changes, edit the copy (or discard and start a focused session) before applying.
+
+## Finding the id you must approve (F1/H9)
+
+You never have to guess the `task_id`:
+
+```
+$ sandboxctl status
+=== preflight: sesiones activas (raíz: /home/u/.hermes/sandbox) ===
+
+  id        : f1g
+  workspace : /home/u/proj
+  comandos  : 4 ejecutados en la copia
+  estado    : ⚠ HAY CAMBIOS PENDIENTES (37 líneas de diff)
+  revisar   : sandboxctl summary f1g
+  aprobar   : sandboxctl apply f1g      # aplica TODO al workspace real
+  descartar : sandboxctl discard f1g    # borra la copia, el real no se toca
+```
+
+The left column is the id, and the approval line is copy-pasteable. When
+`apply` refuses because it has no terminal (`--yes` off a TTY), the refusal also
+prints `sandboxctl apply <that id>`.
 
 ## How it works
 
@@ -86,6 +152,10 @@ applying.
   home** (`get_hermes_home() + /sandbox`), so each profile gets its own sandbox
   namespace; a per-profile `sandbox_root` key (plugin config) overrides it.
   Cloning the user's home or Hermes home is **refused** (`cd into a project`).
+  A PROJECT *inside* the Hermes home is legitimate (`~/.hermes/workspace/<proj>`,
+  `~/.hermes/projects/<proj>`): the refusal is name-precise, covering the config
+  and credential files, the session/state stores, the plugin/skill/memory trees
+  and the sandbox staging root, not "anything under `~/.hermes`" (F1/H10).
 - `execute()` runs the command in the copy with a filtered environment
   (secrets stripped), applies guards, and returns `{output, exit_code}`.
 - The backend sets `uses_host_filesystem = False`, so Hermes' file tools
@@ -94,7 +164,8 @@ applying.
   lands behind the copy/diff/apply gate.
 - After each command it recomputes the diff original ↔ copy (`git diff
   --no-index` when there is a `.git`, `diff -ruN` otherwise) into
-  `PENDING.diff`.
+  `PENDING.diff`, dropping its own `PENDING.diff` section so the review never
+  diffs itself (F1/H1).
 - **Nothing applies on its own.** `apply` runs a sync of the copy into the real
   workspace (no global `--delete`) after verifying a fingerprint that the real
   workspace has not changed since the clone (TOCTOU, now a sha256 content hash
@@ -254,6 +325,18 @@ are by name, not in the abstract:
   a fresh review still refuses if another real change happened meanwhile.
 - The raw diff includes absolute path names; in a git repo you may want to
   review `PENDING.diff` against the repo.
+- **The review list is a summary, not a proof of the apply.** It is built from
+  a tree diff plus `rsync -ani --delete` — the same inputs `apply` uses — but
+  `apply` is still a whole-workspace `rsync -a`: a file whose mtime/size did
+  not change can be synced, and the summary shows the FIRST 20 files (the rest
+  are counted). It also does **not** show *why* a row is there beyond
+  kind + line count: read the technical diff below it before approving a large
+  change. `sandboxctl status`'s "N comandos" counter is written inside the
+  copy, so a sandboxed command can edit it: it is a hint, not evidence.
+- **The Hermes-home allowlist is name-based.** A project under
+  `~/.hermes/workspace/<proj>` is allowed (F1/H10), but a directory you *name*
+  like the excluded ones (e.g. `~/.hermes/workspace/plugins`) is refused to be
+  cloned/applied, because the check matches path components. Pick another name.
 
 ## Multiple profiles
 
@@ -305,7 +388,7 @@ or derived), so it cannot aim `discard` at another profile's sessions.
 ## Quick verification
 
 ```bash
-python3 tests/_test_sandbox.py   # must end with: TODO PASS ✔ (47 PASS)
+python3 tests/_test_sandbox.py   # must end with: TODO PASS ✔ (52 PASS)
 python3 tests/_probe_leak.py     # must end with: TODO OK: sin fugas
 python3 tests/_poc_evidence.py   # demos the audited PoCs are mitigated
 hermes plugins validate ~/.hermes/plugins/preflight   # Validation passed, security scan safe

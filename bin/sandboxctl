@@ -3,18 +3,26 @@
 # Usage: sandboxctl <status|diff|apply|discard> [task_id] [--yes]
 # Run `sandboxctl --help` for the full usage and security notes.
 #
-# apply    : syncs the sandbox copy INTO the real workspace (whole-workspace,
-#            no per-file selection) and applies explicit deletions, NEVER a
-#            global --delete. First validates the registered target (refuses
-#            home / Hermes home / credential stores / system dirs / anything
-#            inside the sandbox root), then verifies (fingerprint) that the real
+# status   : lists the active sessions in plain language (readable id, real
+#            workspace, number of commands run, whether there is something to
+#            apply) plus the EXACT command to approve each one. The id to use is
+#            the one in the left column.
+# apply    : shows a human-readable summary FIRST (per file: edited with how many
+#            lines, created, DELETED, permissions before -> after), then the
+#            technical diff, and only then asks for confirmation. Then syncs the
+#            sandbox copy INTO the real workspace (whole-workspace, no per-file
+#            selection) and applies explicit deletions, NEVER a global --delete.
+#            First validates the registered target (refuses home / Hermes config
+#            and session trees / credential stores / system dirs / anything inside
+#            the sandbox root), then verifies (fingerprint) that the real
 #            workspace did not change since the clone (TOCTOU) and that the copy
 #            contains no symlink escaping the sandbox root. Requires
 #            confirmation: --yes is honored ONLY when stdin is a terminal.
+#            The summary and the diff are the REVIEW view; apply never reads
+#            them to decide what to copy (it syncs the copy).
 # discard  : removes the copy. The real workspace is not touched, and the
 #            registered target is never read: discard works on any session.
 #            Requires the same interactive confirmation as apply.
-# status   : lists existing sessions and their PENDING.diff.
 # diff     : prints a session's PENDING.diff.
 set -euo pipefail
 shopt -s nullglob
@@ -24,10 +32,14 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 sandboxctl — preflight session control.
 
 Usage:
-  sandboxctl status                     list sessions under the sandbox root
-  sandboxctl diff   <task_id>           print the session's PENDING.diff
-  sandboxctl apply  <task_id> [--yes]   sync the copy into the real workspace
+  sandboxctl status                     list sessions: readable id, workspace, commands, pending
+  sandboxctl diff   <task_id>           print the session's PENDING.diff (technical diff)
+  sandboxctl summary <task_id>          print only the human-readable review of a session
+  sandboxctl apply  <task_id> [--yes]   show the review, then sync the copy into the real workspace
   sandboxctl discard <task_id> [--yes]  remove the copy (real workspace untouched)
+
+Finding the id: run `sandboxctl status`. The left column is the task id to
+pass here (the same one printed at the top of every review message).
 
 Security notes (read carefully):
   * apply and discard require interactive confirmation. --yes is honored ONLY
@@ -51,9 +63,12 @@ Security notes (read carefully):
     accepted as transport for scripts/tests and MUST match the effective root
     (marker or derived); a mismatched value is refused.
   * apply is WHOLE-WORKSPACE: it syncs the whole copy (rsync -a, no global
-    --delete). PENDING.diff is the review gate for CONTENT, not a byte-exact
-    preview: mtimes/permissions can change without appearing in the diff.
-    Files under the pinned TMPDIR (.preflight-tmp) are never applied.
+    --delete) and applies explicit deletions. The review shows the FILE LIST
+    (created / edited / DELETED / permissions before -> after, from the tree
+    diff plus `rsync --dry-run`) before the technical diff; the technical diff
+    is CONTENT only, so permissions and mtime-only changes appear in the
+    review list, not as diff lines. Files under the pinned TMPDIR
+    (.preflight-tmp) are never applied and never listed.
   * After a successful apply the session is left CLEAN: PENDING.diff is
     emptied and the fingerprint is refreshed, so reusing the same task_id
     legitimately starts a fresh review (the next create_environment re-clones
@@ -101,6 +116,163 @@ fi
 cmd="${1:-status}"
 task_id="${2:-}"
 
+# Human-readable review of a session (F1/R1, F1/H4, F1/H5). ONE implementation
+# for every caller, so the message a human reads on `apply` is exactly the one
+# `summary`/`status` print. Two REAL sources, the same the apply uses:
+#   * a tree diff (git diff --no-index when the workspace is a repo, diff -ruN
+#     otherwise) -> created / edited (+ how many changed lines);
+#   * `rsync -ani --delete` (dry run, same excludes as apply) -> "*deleting"
+#     (authoritative, works WITHOUT git) and the mode flag ("p") for
+#     permissions, which the content diff does not show.
+# It never reads PENDING.diff, so it cannot inherit the self-diff and cannot
+# disagree with what apply would do. Apply never reads this output to decide.
+print_review() {  # usage: print_review <orig> <copy>
+  python3 - "$1" "$2" "$3" "$4" <<'PYEOF' || echo "  (no se pudo calcular el resumen; usa el diff técnico de abajo)"
+import os, re, subprocess, sys
+
+orig, copy, label = sys.argv[1], sys.argv[2], sys.argv[3]
+MAX = 20
+EXCL = ["--exclude=PENDING.diff", "--exclude=.preflight-tmp"]
+
+def sh(argv):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=120,
+                           stdin=subprocess.DEVNULL)
+        return (p.stdout or "") + (p.stderr or "")
+    except Exception:
+        return ""
+
+if os.path.isdir(os.path.join(orig, ".git")):
+    body = sh(["git", "diff", "--no-index", "--no-color", "--", orig, copy])
+else:
+    body = sh(["diff", "-ruN", "-x", "PENDING.diff", orig, copy])
+
+def rel_of(raw):
+    raw = raw.strip().strip('"')
+    if raw in ("/dev/null", ""):
+        return ""
+    for base in (copy, orig):
+        for pref in ("a" + base, "b" + base, base):
+            if raw.startswith(pref):
+                return raw[len(pref):].lstrip("/")
+    return raw.lstrip("/")
+
+stats, current = {}, None
+for line in body.splitlines():
+    if line.startswith(("diff --git ", "diff -ruN ", "diff -u ")):
+        parts = line.split()
+        current = rel_of(parts[-1]) if parts else ""
+        if current in ("", "pENDING.diff") or current.endswith("PENDING.diff") \
+           or ".preflight-tmp" in current:
+            current = None
+            continue
+        stats.setdefault(current, 0)
+        continue
+    if line.startswith("+++ "):
+        parts = line.split("\t")[0].split()
+        rel = rel_of(parts[1]) if len(parts) > 1 else ""
+        if rel:
+            current = rel
+            stats.setdefault(current, 0)
+        continue
+    if line.startswith("--- "):
+        parts = line.split("\t")[0].split()
+        rel = rel_of(parts[1]) if len(parts) > 1 else ""
+        if rel and current is None:
+            current = rel
+            stats.setdefault(current, 0)
+        continue
+    if line.startswith(("@@", "Only in ", "Index ", "\\ No newline")):
+        continue
+    if current and line[:1] in ("+", "-") and not line.startswith(("+++", "---")):
+        stats[current] = stats.get(current, 0) + 1
+stats.pop("PENDING.diff", None)
+# the pinned TMPDIR is never part of the review (apply excludes it too)
+for _k in [k for k in stats if k.startswith(".preflight-tmp")]:
+    stats.pop(_k, None)
+
+meta = []
+for raw in sh(["rsync", "-ani", "--delete", *EXCL, copy + "/", orig + "/"]).splitlines():
+    line = raw.rstrip()
+    if not line or line.startswith(("sending ", "sent ")):
+        continue
+    if line.startswith("*deleting "):
+        meta.append((line[len("*deleting "):].lstrip(), "*deleting"))
+    elif len(line) > 12 and line[11:12] == " ":
+        rel = line[12:]
+        if rel in (".", "./") or rel.endswith("/"):
+            continue
+        meta.append((rel, line[:11]))
+
+deleted, perms, only_meta = {}, {}, {}
+for rel, code in meta:
+    rel = rel[2:] if rel.startswith("./") else rel
+    if rel.startswith(".preflight-tmp"):
+        continue  # pinned TMPDIR: never applied, never listed
+    if code == "*deleting":
+        deleted[rel.rstrip("/")] = None
+    elif "p" in code:
+        perms[rel] = code
+    elif rel not in stats and rel not in deleted:
+        only_meta[rel] = code
+for rel in stats:
+    if not os.path.lexists(os.path.join(copy, rel)):
+        deleted[rel] = None
+for rel in list(only_meta):
+    if not os.path.lexists(os.path.join(copy, rel)):
+        deleted[rel] = None
+        only_meta.pop(rel, None)
+# one row per real path: collapse a deletion reported under a longer prefix
+for rel in sorted(list(deleted), key=lambda r: (r.count("/"), r)):
+    for other in deleted:
+        if other != rel and other.endswith("/" + rel):
+            deleted.pop(rel, None)
+            break
+
+def mode(base, rel):
+    try:
+        return oct(os.lstat(os.path.join(base, rel)).st_mode & 0o777)[2:]
+    except OSError:
+        return None
+
+rows = []
+for rel in sorted(stats):
+    if rel in deleted:
+        continue
+    if not os.path.lexists(os.path.join(orig, rel)):
+        rows.append(("➕", rel, "nuevo"))
+        continue
+    n = stats.get(rel, 0)
+    rows.append(("✏️", rel, "%d líneas cambiadas" % n if n else "cambiado"))
+for rel in only_meta:
+    if rel not in deleted and rel not in stats:
+        rows.append(("✏️", rel, "cambiado (tamaño/fecha)"))
+for rel in perms:
+    before, after = mode(orig, rel), mode(copy, rel)
+    rows.append(("🔒", rel, "permisos %s → %s" % (before, after) if before and after and before != after
+                 else "permisos (cambiados)"))
+for rel in deleted:
+    rows.append(("❌", rel, "BORRADO"))
+order = {"✏️": 0, "➕": 1, "🔒": 2, "❌": 3}
+rows.sort(key=lambda r: (order.get(r[0], 9), r[1]))
+
+n_new = sum(1 for r in rows if r[0] == "➕")
+n_edit = sum(1 for r in rows if r[0] == "✏️")
+n_del = sum(1 for r in rows if r[0] == "❌")
+n_perm = sum(1 for r in rows if r[0] == "🔒")
+n_files = len({r[1] for r in rows})  # a file can be both edited and re-permissioned
+width = max([len(r[1]) for r in rows] + [8])
+print("📋 Cambios pendientes en '%s'  (%d archivos: +%d ~%d -%d%s)" % (
+    label, n_files, n_new, n_edit, n_del, " 🔒%d" % n_perm if n_perm else ""))
+if not rows:
+    print("   (sin cambios respecto al workspace real)")
+for icon, rel, detail in rows[:MAX]:
+    print("   %s %-*s  %s" % (icon, width, rel, detail))
+if len(rows) > MAX:
+    print("   … y %d archivos más (ver el diff completo para la lista entera)" % (len(rows) - MAX))
+PYEOF
+}
+
 # --yes is honored ONLY on an interactive terminal. This is BEST-EFFORT: a
 # determined agent can allocate a pty (script/pty module/ssh -tt) and
 # self-approve; the gate stops accidental non-TTY approvals, not a determined
@@ -109,25 +281,54 @@ have_yes=0
 for a in "$@"; do [[ "$a" == "--yes" || "$a" == "-y" ]] && have_yes=1; done
 if [[ "$have_yes" -eq 1 && ! -t 0 ]]; then
   echo "✖ --yes is only honored on an interactive terminal (best-effort guard: a determined process can allocate a pty and self-approve). Run it yourself." >&2
+  # F1/H9: never leave the human guessing which id to approve.
+  if [[ -n "${2:-}" && "${2:-}" != --* ]]; then
+    echo "  Run:" >&2
+    echo "    sandboxctl $cmd $2" >&2
+  else
+    echo "  Run 'sandboxctl status' to get the id, then 'sandboxctl $cmd <task_id>'." >&2
+  fi
   exit 2
 fi
 
 if [[ "$cmd" == "status" ]]; then
-  echo "=== preflight: sessions (root: $ROOT) ==="
+  echo "=== preflight: sesiones activas (raíz: $ROOT) ==="
   if [[ ! -d "$ROOT" ]]; then
-    echo "  (no sessions under $ROOT)"
+    echo "  (no hay sesiones en $ROOT)"
     exit 0
   fi
+  found=0
   for ws in "$ROOT"/*/workspace; do
     [[ -d "$ws" ]] || continue
+    found=1
     id="$(basename "$(dirname "$ws")")"
+    # Commands run in this session (one marker file per execute(); the diff
+    # writer does not create markers). Session metadata, not the review.
+    ncmds=0
+    [[ -f "$ws/.preflight-tmp/.cmd-count" ]] && ncmds="$(cat "$ws/.preflight-tmp/.cmd-count" 2>/dev/null || echo 0)"
     pending=0
     if [[ -f "$ws/PENDING.diff" ]]; then
       # real diff lines (starting with + / - / diff / Only / Index)
       pending="$(grep -cE '^[+-]|^diff |^Only |^Index ' "$ws/PENDING.diff" || true)"
     fi
-    echo "  $id  (pending changes: $pending)"
+    orig="$(cat "$ROOT/$id/original" 2>/dev/null || echo '(registro ausente)')"
+    echo
+    echo "  id        : $id"
+    echo "  workspace : $orig"
+    echo "  comandos  : $ncmds ejecutados en la copia"
+    if [[ "$pending" -gt 0 ]]; then
+      echo "  estado    : ⚠ HAY CAMBIOS PENDIENTES (${pending} líneas de diff)"
+      echo "  revisar   : sandboxctl summary $id"
+      echo "  aprobar   : sandboxctl apply $id      # aplica TODO al workspace real"
+      echo "  descartar : sandboxctl discard $id    # borra la copia, el real no se toca"
+    else
+      echo "  estado    : sin cambios pendientes (nada que aplicar)"
+      echo "  descartar : sandboxctl discard $id"
+    fi
   done
+  if [[ "$found" -eq 0 ]]; then
+    echo "  (no hay sesiones en $ROOT)"
+  fi
   exit 0
 fi
 
@@ -224,6 +425,16 @@ case "$cmd" in
     [[ -f "$WS/PENDING.diff" ]] && cat "$WS/PENDING.diff" || echo "(no PENDING.diff)"
     ;;
 
+  summary)
+    # The review ONLY (no apply, no confirmation): same block apply prints.
+    if [[ -f "$ORIGIN_FILE" ]]; then
+      print_review "$(cat "$ORIGIN_FILE")" "$WS" "$task_id" ""
+    else
+      echo "✖ missing original-workspace record for $task_id (cannot build the review)."
+      exit 1
+    fi
+    ;;
+
   apply)
     # 0) Is this a legitimate apply target? The registration record is writable
     #    inside the staging root, so a crafted <id>/original could aim a
@@ -261,10 +472,55 @@ case "$cmd" in
       echo "  A whole-workspace apply onto ~ would overwrite your personal files. Discard this session and start one in a project directory." >&2
       exit 1
     fi
-    if _is_under "$ORIG_REAL" "$HERMES_HOME_REAL"; then
-      echo "✖ refusing to apply onto the Hermes home: $ORIG_REAL" >&2
-      echo "  Applying there would overwrite Hermes' own config/sessions. Discard this session and start one in a project directory." >&2
+    # F1/H10: a project under the Hermes home is a legitimate target
+    # (~/.hermes/workspace/<proj>), but the Hermes CONFIG and LIVE SESSION trees
+    # are never an apply target. Same names as the backend's
+    # _HERMES_HOME_EXCLUDE: a path is refused when it IS or CONTAINS one of
+    # these entries (config.yaml, profiles, sessions.db, plugins, sandbox...).
+    HERMES_EXCLUDE=(
+      config.yaml config profiles profiles.d profile.yaml auth.json auth.lock
+      cookies tokens sessions sessions.db state.db state state-snapshots
+      responses response_store.db recovered-state.db terminal-sessions
+      checkpoints pending pending_messages processes.json runtime
+      gateway_state.json gateway.sock gateway.lock gateway.pid kanban kanban.db
+      lcm.db memory_store.db projects.db runs_idempotency.db safety
+      plugins skills memories hooks hermes-agent bin scripts tools lsp pairing
+      security shared shared-state.db sandbox sandboxes cache logs image_cache
+      audio_cache plugin-data plugin-update-checks install_id installs
+    )
+    while IFS= read -r bad; do
+      echo "✖ refusing to apply onto a Hermes config/session tree: $ORIG_REAL" >&2
+      echo "  '$bad' is Hermes' own config, session or runtime state, not a project. Discard this session and start one in a project directory." >&2
       exit 1
+    done < <(python3 - "$ORIG_REAL" "$HERMES_HOME_REAL" "${HERMES_EXCLUDE[@]}" <<'PYEOF'
+import os, sys
+orig, hh, names = sys.argv[1], sys.argv[2], set(sys.argv[3:])
+o = os.path.realpath(orig)
+h = os.path.realpath(hh)
+if o == h or not (o == h or o.startswith(h.rstrip("/") + "/")):
+    sys.exit(0)  # not under the Hermes home: nothing to check here
+rel = os.path.relpath(o, h)
+parts = rel.split(os.sep)
+for i, part in enumerate(parts):
+    if part in names:
+        print(os.sep.join(parts[: i + 1]))
+        break
+PYEOF
+)
+    # A HOME directory is never an apply target. F1/H10 only made PROJECTS
+    # inside a Hermes home legal (~/.hermes/workspace/<proj>); the home itself
+    # still takes no whole-workspace sync. Detected structurally (a Hermes home
+    # has config.yaml plus a shell rc, or sessions+cache) and by name, rather
+    # than via one hard-coded path, because the suite and alternate profiles use
+    # their own homes. $HOME itself is refused a few lines above.
+    if [[ "$ORIG_REAL" != "$HOME_REAL" ]]; then
+      if [[ -f "$ORIG_REAL/config.yaml" && -f "$ORIG_REAL/.bashrc" ]] \
+         || [[ "$(basename "$ORIG_REAL")" =~ ^(sbx-)?home(-[0-9a-z]+)?$ ]] \
+         || [[ -d "$ORIG_REAL/sessions" && -d "$ORIG_REAL/cache" ]]; then
+        echo "✖ refusing to apply onto the Hermes home directory: $ORIG_REAL" >&2
+        echo "  That is Hermes' own home (config + sessions), not a project. Applying would overwrite it. Discard this session and start one in a project directory." >&2
+        exit 1
+      fi
     fi
     for _sens in .ssh .aws .gnupg; do
       if _is_under "$ORIG_REAL" "$HOME_REAL/$_sens"; then
@@ -326,10 +582,16 @@ PYEOF
       exit 1
     fi
 
-    echo "▶ Applying changes of '$task_id' to the real workspace..." 
+    echo "▶ Applying changes of '$task_id' to the real workspace..."
     echo "  source : $WS"
     echo "  target : $ORIG"
-    diff_show="$(grep -E '^[+-]|^diff |^Only |^Index ' "$WS/PENDING.diff" 2>/dev/null || true)"
+    echo
+    # REVIEW FIRST, diff second (F1/R1). A human decides from the file list;
+    # the technical diff stays available right below for the details.
+    print_review "$(cat "$ORIGIN_FILE")" "$WS" "$task_id" ""
+    echo
+    echo "── diff técnico ──────────────────────────────────────────────"
+    diff_show="$(grep -E '^[+-]|^diff |^Only |^Index |^Binary ' "$WS/PENDING.diff" 2>/dev/null || true)"
     total="$(printf '%s\n' "$diff_show" | sed '/^$/d' | wc -l | tr -d ' ')"
     printf '%s\n' "$diff_show" | head -n 60 || true
     if (( total > 60 )); then
@@ -341,9 +603,12 @@ PYEOF
       # script, so a human explicitly approved this apply.
       ans=s
     elif [[ -t 0 ]]; then
-      read -r -p "Apply? this OVERWRITES the real workspace [y/N]: " ans
+      read -r -p "Aprobar y escribir en el workspace real ('$ORIG')? [s/N]: " ans
     else
+      # H9: even when we cannot ask, print the EXACT command that approves.
       echo "✖ apply requires interactive confirmation (best-effort guard: a determined process can allocate a pty and self-approve)." >&2
+      echo "  To approve interactively, run:" >&2
+      echo "    sandboxctl apply $task_id" >&2
       exit 2
     fi
 

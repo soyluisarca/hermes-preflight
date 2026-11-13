@@ -572,8 +572,9 @@ def build_review_summary(original: Path, sandbox: Path, *, label: str | None = N
     total = len({r[1] for r in rows})
 
     width = max([len(r[1]) for r in rows] + [8])
+    suffix = "archivo:" if total == 1 else "archivos:"
     lines = [
-        f"📋 Cambios pendientes en '{name}'  ({total} archivos: "
+        f"📋 Cambios pendientes en '{name}'  ({total} {suffix} "
         f"+{n_new} ~{n_edit} -{n_del}" + (f" 🔒{n_perm}" if n_perm else "") + ")",
     ]
     if not rows:

@@ -27,6 +27,54 @@
 set -euo pipefail
 shopt -s nullglob
 
+# ── Locale ───────────────────────────────────────────────────────────────────
+# English is the DEFAULT: the catalog is English-first. PREFLIGHT_LANG=es keeps
+# the original Spanish wording of the human-facing review / status / approval
+# surface. The security guards and their refusal messages are English in both
+# locales (they are diagnostic, not conversational).
+export PF_LANG="${PREFLIGHT_LANG:-en}"
+
+# _t <key> [args...] — the message for <key> in the active locale, printf-format.
+# NOTE: the summary rows below are emitted by an embedded Python block that has
+# to run standalone (this CLI must work with the plugin NOT loaded), so it keeps
+# its own copy of the same table. Keep the two in sync.
+_t() {
+  local key="$1"; shift
+  local en="" es=""
+  case "$key" in
+    review_header)   en='📋 Pending changes in %s  (%d files: +%d ~%d -%d%s)'
+                     es='📋 Cambios pendientes en %s  (%d archivos: +%d ~%d -%d%s)' ;;
+    review_failed)   en='  (could not compute the summary; use the technical diff below)'
+                     es='  (no se pudo calcular el resumen; usa el diff técnico de abajo)' ;;
+    status_header)   en='=== preflight: active sessions (root: %s) ==='
+                     es='=== preflight: sesiones activas (raíz: %s) ===' ;;
+    no_sessions)     en='  (no sessions in %s)'
+                     es='  (no hay sesiones en %s)' ;;
+    meta_missing)    en='(record missing)'
+                     es='(registro ausente)' ;;
+    cmds_run)        en='  commands  : %s run in the copy'
+                     es='  comandos  : %s ejecutados en la copia' ;;
+    state_pending)   en='  state     : ⚠ PENDING CHANGES (%s diff lines)'
+                     es='  estado    : ⚠ HAY CAMBIOS PENDIENTES (%s líneas de diff)' ;;
+    state_clean)     en='  state     : no pending changes (nothing to apply)'
+                     es='  estado    : sin cambios pendientes (nada que aplicar)' ;;
+    hint_review)     en='  review    : sandboxctl summary %s'
+                     es='  revisar   : sandboxctl summary %s' ;;
+    hint_apply)      en='  approve   : sandboxctl apply %s      # applies EVERYTHING to the real workspace'
+                     es='  aprobar   : sandboxctl apply %s      # aplica TODO al workspace real' ;;
+    hint_discard)    en='  discard   : sandboxctl discard %s'
+                     es='  descartar : sandboxctl discard %s' ;;
+    hint_discard_safe) en='  discard   : sandboxctl discard %s    # removes the copy, the real workspace is not touched'
+                     es='  descartar : sandboxctl discard %s    # borra la copia, el real no se toca' ;;
+    apply_prompt)    en="Apply and write to the real workspace ('%s')? [y/N]: "
+                     es="Aprobar y escribir en el workspace real ('%s')? [s/N]: " ;;
+    diff_header)     en='── technical diff ────────────────────────────────────────────'
+                     es='── diff técnico ──────────────────────────────────────────────' ;;
+    *)               en="%s"; es="%s" ;;
+  esac
+  if [[ "$PF_LANG" == es* ]]; then printf "$es" "$@"; else printf "$en" "$@"; fi
+}
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<'EOF'
 sandboxctl — preflight session control.
@@ -127,12 +175,46 @@ task_id="${2:-}"
 # It never reads PENDING.diff, so it cannot inherit the self-diff and cannot
 # disagree with what apply would do. Apply never reads this output to decide.
 print_review() {  # usage: print_review <orig> <copy>
-  python3 - "$1" "$2" "$3" "$4" <<'PYEOF' || echo "  (no se pudo calcular el resumen; usa el diff técnico de abajo)"
+  python3 - "$1" "$2" "$3" "$4" <<'PYEOF' || _t review_failed
 import os, re, subprocess, sys
 
 orig, copy, label = sys.argv[1], sys.argv[2], sys.argv[3]
 MAX = 20
 EXCL = ["--exclude=PENDING.diff", "--exclude=.preflight-tmp"]
+
+# Locale. English is the default (the catalog is English-first); PREFLIGHT_LANG=es
+# keeps the original Spanish wording. This block must run standalone (the CLI is
+# usable with the plugin NOT loaded), so it carries its own copy of the table —
+# keep it in sync with _t() in bash above and _MSG in __init__.py.
+_EN = {
+    "new": "new",
+    "changed": "changed",
+    "changed_meta": "changed (size/mtime)",
+    "lines_changed": "%d lines changed",
+    "line_changed": "1 line changed",
+    "deleted": "DELETED",
+    "perm": "permissions %s -> %s",
+    "perm_changed": "permissions (changed)",
+    "header": "\U0001F4CB Pending changes in '%s'  (%d %s +%d ~%d -%d%s)",
+    "file_one": "file:", "file_many": "files:",
+    "no_changes": "   (no changes vs. the real workspace)",
+    "more": "   \u2026 and %d more files (see the full diff for the complete list)",
+}
+_ES = {
+    "new": "nuevo",
+    "changed": "cambiado",
+    "changed_meta": "cambiado (tama\u00f1o/fecha)",
+    "lines_changed": "%d l\u00edneas cambiadas",
+    "line_changed": "1 l\u00ednea cambiada",
+    "deleted": "BORRADO",
+    "perm": "permisos %s \u2192 %s",
+    "perm_changed": "permisos (cambiados)",
+    "header": "\U0001F4CB Cambios pendientes en '%s'  (%d %s +%d ~%d -%d%s)",
+    "file_one": "archivo:", "file_many": "archivos:",
+    "no_changes": "   (sin cambios respecto al workspace real)",
+    "more": "   \u2026 y %d archivos m\u00e1s (ver el diff completo para la lista entera)",
+}
+M = _ES if (os.environ.get("PF_LANG") or os.environ.get("PREFLIGHT_LANG") or "en").lower().startswith("es") else _EN
 
 def sh(argv):
     try:
@@ -240,19 +322,19 @@ for rel in sorted(stats):
     if rel in deleted:
         continue
     if not os.path.lexists(os.path.join(orig, rel)):
-        rows.append(("➕", rel, "nuevo"))
+        rows.append(("\u2795", rel, M["new"]))
         continue
     n = stats.get(rel, 0)
-    rows.append(("✏️", rel, "%d líneas cambiadas" % n if n else "cambiado"))
+    rows.append(("\u270f\ufe0f", rel, M["lines_changed"] % n if n else M["changed"]))
 for rel in only_meta:
     if rel not in deleted and rel not in stats:
-        rows.append(("✏️", rel, "cambiado (tamaño/fecha)"))
+        rows.append(("\u270f\ufe0f", rel, M["changed_meta"]))
 for rel in perms:
     before, after = mode(orig, rel), mode(copy, rel)
-    rows.append(("🔒", rel, "permisos %s → %s" % (before, after) if before and after and before != after
-                 else "permisos (cambiados)"))
+    rows.append(("\U0001f512", rel, M["perm"] % (before, after) if before and after and before != after
+                 else M["perm_changed"]))
 for rel in deleted:
-    rows.append(("❌", rel, "BORRADO"))
+    rows.append(("\u274c", rel, M["deleted"]))
 order = {"✏️": 0, "➕": 1, "🔒": 2, "❌": 3}
 rows.sort(key=lambda r: (order.get(r[0], 9), r[1]))
 
@@ -262,14 +344,15 @@ n_del = sum(1 for r in rows if r[0] == "❌")
 n_perm = sum(1 for r in rows if r[0] == "🔒")
 n_files = len({r[1] for r in rows})  # a file can be both edited and re-permissioned
 width = max([len(r[1]) for r in rows] + [8])
-print("📋 Cambios pendientes en '%s'  (%d archivos: +%d ~%d -%d%s)" % (
-    label, n_files, n_new, n_edit, n_del, " 🔒%d" % n_perm if n_perm else ""))
+print(M["header"] % (
+    label, n_files, M["file_one"] if n_files == 1 else M["file_many"],
+    n_new, n_edit, n_del, " \U0001f512%d" % n_perm if n_perm else ""))
 if not rows:
-    print("   (sin cambios respecto al workspace real)")
+    print(M["no_changes"])
 for icon, rel, detail in rows[:MAX]:
     print("   %s %-*s  %s" % (icon, width, rel, detail))
 if len(rows) > MAX:
-    print("   … y %d archivos más (ver el diff completo para la lista entera)" % (len(rows) - MAX))
+    print(M["more"] % (len(rows) - MAX))
 PYEOF
 }
 
@@ -292,9 +375,9 @@ if [[ "$have_yes" -eq 1 && ! -t 0 ]]; then
 fi
 
 if [[ "$cmd" == "status" ]]; then
-  echo "=== preflight: sesiones activas (raíz: $ROOT) ==="
+  echo "$(_t status_header "$ROOT")"
   if [[ ! -d "$ROOT" ]]; then
-    echo "  (no hay sesiones en $ROOT)"
+    echo "$(_t no_sessions "$ROOT")"
     exit 0
   fi
   found=0
@@ -311,23 +394,23 @@ if [[ "$cmd" == "status" ]]; then
       # real diff lines (starting with + / - / diff / Only / Index)
       pending="$(grep -cE '^[+-]|^diff |^Only |^Index ' "$ws/PENDING.diff" || true)"
     fi
-    orig="$(cat "$ROOT/$id/original" 2>/dev/null || echo '(registro ausente)')"
+    orig="$(cat "$ROOT/$id/original" 2>/dev/null || _t meta_missing)"
     echo
     echo "  id        : $id"
     echo "  workspace : $orig"
-    echo "  comandos  : $ncmds ejecutados en la copia"
+    echo "$(_t cmds_run "$ncmds")"
     if [[ "$pending" -gt 0 ]]; then
-      echo "  estado    : ⚠ HAY CAMBIOS PENDIENTES (${pending} líneas de diff)"
-      echo "  revisar   : sandboxctl summary $id"
-      echo "  aprobar   : sandboxctl apply $id      # aplica TODO al workspace real"
-      echo "  descartar : sandboxctl discard $id    # borra la copia, el real no se toca"
+      echo "$(_t state_pending "$pending")"
+      echo "$(_t hint_review "$id")"
+      echo "$(_t hint_apply "$id")"
+      echo "$(_t hint_discard_safe "$id")"
     else
-      echo "  estado    : sin cambios pendientes (nada que aplicar)"
-      echo "  descartar : sandboxctl discard $id"
+      echo "$(_t state_clean)"
+      echo "$(_t hint_discard "$id")"
     fi
   done
   if [[ "$found" -eq 0 ]]; then
-    echo "  (no hay sesiones en $ROOT)"
+    echo "$(_t no_sessions "$ROOT")"
   fi
   exit 0
 fi
@@ -467,6 +550,31 @@ case "$cmd" in
       [[ "$p" == "$d" || "$p" == "$d"/* ]]
     }
 
+    # Refuse an ANCESTOR (or an equal): a target that CONTAINS home, the Hermes
+    # home or the sandbox root. Everything else here refuses a target that IS
+    # one of those or lives UNDER them — so "/" (and /Users, C:/Users) passed
+    # every check. That mattered because <id>/original is writable inside the
+    # staging root: with a tampered record, step 2's deletions below would
+    # remove every path in the target that is missing from the copy, i.e. the
+    # whole personal tree. `_is_under <p> <d>` is true when <p> equals <d> or
+    # lives below it, so asking it the other way round is exactly the ancestor
+    # test; "/" contains everything and is refused by construction.
+    if _is_under "$HOME_REAL" "$ORIG_REAL"; then
+      echo "✖ refusing to apply onto a directory that CONTAINS your home directory: $ORIG_REAL" >&2
+      echo "  A whole-workspace apply onto an ancestor of ~ would rewrite your personal files. Discard this session and start one in a project directory." >&2
+      exit 1
+    fi
+    if _is_under "$HERMES_HOME_REAL" "$ORIG_REAL"; then
+      echo "✖ refusing to apply onto a directory that CONTAINS the Hermes home: $ORIG_REAL" >&2
+      echo "  Discard this session and start one in a project directory." >&2
+      exit 1
+    fi
+    if _is_under "$ROOT" "$ORIG_REAL"; then
+      echo "✖ refusing to apply onto a directory that CONTAINS the sandbox root: $ORIG_REAL" >&2
+      echo "  Discard this session and start one in a project directory." >&2
+      exit 1
+    fi
+
     if [[ "$ORIG_REAL" == "$HOME_REAL" ]]; then
       echo "✖ refusing to apply onto your home directory: $ORIG_REAL" >&2
       echo "  A whole-workspace apply onto ~ would overwrite your personal files. Discard this session and start one in a project directory." >&2
@@ -590,7 +698,7 @@ PYEOF
     # the technical diff stays available right below for the details.
     print_review "$(cat "$ORIGIN_FILE")" "$WS" "$task_id" ""
     echo
-    echo "── diff técnico ──────────────────────────────────────────────"
+    echo "$(_t diff_header)"
     diff_show="$(grep -E '^[+-]|^diff |^Only |^Index |^Binary ' "$WS/PENDING.diff" 2>/dev/null || true)"
     total="$(printf '%s\n' "$diff_show" | sed '/^$/d' | wc -l | tr -d ' ')"
     printf '%s\n' "$diff_show" | head -n 60 || true
@@ -603,7 +711,7 @@ PYEOF
       # script, so a human explicitly approved this apply.
       ans=s
     elif [[ -t 0 ]]; then
-      read -r -p "Aprobar y escribir en el workspace real ('$ORIG')? [s/N]: " ans
+      read -r -p "$(_t apply_prompt "$ORIG")" ans
     else
       # H9: even when we cannot ask, print the EXACT command that approves.
       echo "✖ apply requires interactive confirmation (best-effort guard: a determined process can allocate a pty and self-approve)." >&2

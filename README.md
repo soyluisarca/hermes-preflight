@@ -22,6 +22,12 @@ hermes config set terminal.backend preflight
 That's it. Your next terminal commands run inside a copy of the workspace and
 nothing is applied until you run `sandboxctl apply <task_id>`.
 
+The review, status and approval surface is **English by default** (the plugin
+catalog is English-first). `PREFLIGHT_LANG=es` restores the original Spanish
+wording of that surface. The security guards and their refusal messages are
+English in both locales — they are diagnostic, and a refusal should not need
+translating before it can be acted on.
+
 ## Why preflight?
 
 Today an agent just executes real commands: a wrong `rm -rf` is data gone
@@ -207,6 +213,12 @@ prints `sandboxctl apply <that id>`.
 - `apply` also refuses a dangerous target recorded in `<id>/original`: your
   home, the Hermes home, `~/.ssh` / `~/.aws` / `~/.gnupg`, `/etc` and `/var`
   (same list the backend uses to refuse a clone), checked before any rsync.
+- `apply` refuses an **ancestor** too: a target that *contains* your home, the
+  Hermes home or the sandbox root. So `/`, `/Users` and `C:/Users` are refused,
+  not only a target that *is* one of those or *lives under* them. Without that
+  check a tampered `<id>/original` could aim the whole-workspace rsync at `/`,
+  and the explicit-deletion step would then remove every path in the target
+  that is missing from the copy — the entire personal tree.
 
 ## Security guards (best-effort)
 
@@ -215,18 +227,20 @@ prints `sandboxctl apply <that id>`.
   backslash escapes are stripped for the match), so wrappers like
   `bash -c 'sudo …'` are caught too.
 - Rejects absolute paths that point **outside** the copy (including a bare `/`).
-  Paths are **resolved** before the boundary test, so `/tmp/../etc/passwd`
+  Paths are **resolved** before the boundary test, so an embedded `..` segment
   cannot dodge it.
 - Shell variables in command tokens are expanded **against the child's env**
   before the boundary test (the same env that is injected: HOME and TMPDIR are
-  pinned inside the copy). That closes the `$EMPTY/etc/passwd` class of
-  bypasses — an unset variable expands to the empty string, `/etc/passwd` is
-  seen for what it is and blocked. `$HOME/…` and `$TMPDIR/…` resolve inside the
-  copy and keep working normally. Variables defined *inside the command itself*
-  (`X=/etc; cat $X/passwd`) are invisible to this heuristic.
+  pinned inside the copy). That closes the empty-variable class of bypasses: an
+  unset variable expands to the empty string, so an absolute path to a system
+  file outside the copy is seen for what it is and blocked. `$HOME/…` and
+  `$TMPDIR/…` resolve inside the copy and keep working normally. Variables
+  defined *inside the command itself* (`X=<dir>; cat $X/notes`) are invisible to
+  this heuristic.
 - Rejects relative paths that **escape** the copy by resolving every path-ish
   token against the copy's cwd — including embedded `..` that does not start
-  with a dot, e.g. `a/../../x.txt` or `cat a/../../../etc/passwd`.
+  with a dot, e.g. `a/../../x.txt` or a run of `..` segments reaching a system
+  file outside the copy.
 - Rejects write redirections (`>`, `2>`) to paths outside the copy.
 - Rejects the operation if the copy contains **symlinks that escape** the
   sandbox (preserved by the clone; a symlink to `/etc` or `~/.ssh` would
@@ -290,8 +304,8 @@ are by name, not in the abstract:
   value when it predates the pin (the pin replaces the value the child sees,
   but the *string* `$TMPDIR` in a command is only judged after expansion).
 - **Invoked scripts can still touch the host.** The guards see `bash
-  script.sh`, not the script's contents: a script that contains `cat
-  /etc/passwd` or `echo x > $HOME/out` runs on the host. Same for `python3 -c
+  script.sh`, not the script's contents: a script that reads a system file
+  outside the copy, or writes into your home, runs on the host. Same for `python3 -c
   "..."`, `python -`, `. file.sh`, `source`, `curl | sh`, or any subprocess
   that executes code from inside a file. The line of command is scanned; the
   file it runs is not.

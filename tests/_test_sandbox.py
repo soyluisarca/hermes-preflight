@@ -44,6 +44,13 @@ Cubre (del más antiguo al más nuevo):
      otra sesión; `apply` sigue rechazando destinos peligrosos (fix 3).
  36. ronda 5 (B2): contrato apply-rechaza / discard-borra con la sesión real y el
      registro manipulado a HOME: apply rc!=0 sin escribir, discard rc=0 y borra.
+ 37. review ronda 3: `apply` rechaza también un ANCESTRO (o igual) de HOME, del
+     Hermes home y del sandbox root — "/" y "/Users" incluidos. Antes solo
+     rechazaba un target que ES uno de esos o vive DENTRO; con el registro
+     manipulado, el paso de borrados habría vaciado el árbol entero del target.
+     Un ORIG legítimo sigue aceptándose (sin sobre-rechazo).
+ 38. review ronda 3: la superficie humana (review/status/prompt/diff header) es
+     INGLÉS por defecto; PREFLIGHT_LANG=es restaura el español.
 """
 import json
 import os
@@ -1046,7 +1053,7 @@ def _f1_fixture(git: bool, tag: str):
 
 def _f1_parse(rs):
     """(header_counts, {(icon, path): detail}) de la salida real del resumen."""
-    m = re.search(r"\((\d+) archivos: \+(\d+) ~(\d+) -(\d+)(?: 🔒(\d+))?\)", rs[0])
+    m = re.search(r"\((\d+) (?:archivos|files): \+(\d+) ~(\d+) -(\d+)(?: 🔒(\d+))?\)", rs[0])
     assert m, f"F1/R1: cabecera sin conteos: {rs[0]!r}"
     counts = tuple(int(g or 0) for g in m.groups())
     rows = {}
@@ -1071,29 +1078,29 @@ for git in (True, False):
     titles39[tag], rows39[tag] = rs[0], text
     counts, rows = _f1_parse(rs)
     parsed39[tag] = (counts, rows)
-    assert "src/app.py" in text and "2 líneas cambiadas" in text, f"F1/R1 ({tag}) editado: {text}"
-    assert "docs/NEW.md" in text and "nuevo" in text, f"F1/R1 ({tag}) nuevo: {text}"
-    assert "keepme.txt" in text and "BORRADO" in text, f"F1/R1 ({tag}) borrado (H4): {text}"
-    assert "src/s.sh" in text and "permisos" in text and "755" in text and "600" in text, (
+    assert "src/app.py" in text and "2 lines changed" in text, f"F1/R1 ({tag}) editado: {text}"
+    assert "docs/NEW.md" in text and "new" in text, f"F1/R1 ({tag}) nuevo: {text}"
+    assert "keepme.txt" in text and "DELETED" in text, f"F1/R1 ({tag}) borrado (H4): {text}"
+    assert "src/s.sh" in text and "permissions" in text and "755" in text and "600" in text, (
         f"F1/R1 ({tag}) permisos (H5): {text}"
     )
     assert "PENDING.diff" not in text, f"F1/R1 ({tag}): el resumen menciona PENDING.diff: {text}"
     assert ".preflight-tmp" not in text, (
         f"F1/R1 ({tag}): el TMPDIR pinneado aparece en el resumen (no se aplica): {text}"
     )
-    assert "Cambios pendientes" in titles39[tag], f"F1/R1 ({tag}) cabecera: {titles39[tag]!r}"
+    assert "Pending changes" in titles39[tag], f"F1/R1 ({tag}) cabecera: {titles39[tag]!r}"
     print(f"  (F1 {tag}) {titles39[tag].strip()}")
     shutil.rmtree(w, ignore_errors=True)
 
 # 39a) Filas IDÉNTICAS en ambos backends, fila por fila (icono, archivo, detalle).
 # Cada backend se compara contra el contrato EXACTO de lo que el código emite.
 F1_EXPECTED_COMMON = {
-    ("✏️", "src/app.py"): "2 líneas cambiadas",
-    ("➕", "docs/NEW.md"): "nuevo",
-    ("🔒", "src/s.sh"): "permisos 755 → 600",
-    ("❌", "keepme.txt"): "BORRADO",
+    ("✏️", "src/app.py"): "2 lines changed",
+    ("➕", "docs/NEW.md"): "new",
+    ("🔒", "src/s.sh"): "permissions 755 -> 600",
+    ("❌", "keepme.txt"): "DELETED",
 }
-F1_EXPECTED_GIT_ONLY = {("✏️", "src/s.sh"): "cambiado"}   # modo solo: git lo ve, diff -ruN no
+F1_EXPECTED_GIT_ONLY = {("✏️", "src/s.sh"): "changed"}   # modo solo: git lo ve, diff -ruN no
 F1_CONTRACT = {
     "g": ((4, 1, 2, 1, 1), {**F1_EXPECTED_COMMON, **F1_EXPECTED_GIT_ONLY}),
     "n": ((4, 1, 1, 1, 1), dict(F1_EXPECTED_COMMON)),
@@ -1154,7 +1161,7 @@ st41 = out41
 assert ok41 == 0, f"status rc={ok41}: {out41[:400]!r}"
 assert "f1g" in st41 or "f1n" in st41 or "f1h1" in st41, f"F1/H9: status no lista las task_id: {st41[:600]!r}"
 assert "sandboxctl apply " in st41, f"F1/H9: status no imprime el comando de aprobación: {st41[:600]!r}"
-assert "workspace" in st41 and "comandos" in st41, f"F1/H9: status no muestra workspace/comandos: {st41[:600]!r}"
+assert "workspace" in st41 and "commands" in st41, f"F1/H9: status no muestra workspace/commands: {st41[:600]!r}"
 print("  (H9) " + " | ".join(l.strip() for l in st41.splitlines() if "sandboxctl apply" in l)[:200])
 bump("41")
 
@@ -1166,16 +1173,45 @@ e42 = provider.create_environment(cwd=str(w42), timeout=20, task_id="f1a")
 assert e42.execute("echo plus > extra.txt")["exit_code"] == 0
 assert e42.execute("chmod 640 docs/guide.md")["exit_code"] == 0
 code42, out42 = run_sbctl_tty("apply", "f1a", answer="n\n")  # se cancela: solo se mira la vista
-pos_summary = out42.find("Cambios pendientes")
-pos_diff = out42.find("diff técnico")
+pos_summary = out42.find("Pending changes")
+pos_diff = out42.find("technical diff")
 assert pos_summary != -1, f"F1/R1: apply no imprime el resumen humano: {out42[:800]!r}"
 assert pos_diff != -1, f"F1/R1: apply no imprime el diff técnico: {out42[:800]!r}"
 assert pos_summary < pos_diff, (
     f"F1/R1: el diff técnico sale ANTES del resumen (summary@{pos_summary}, diff@{pos_diff})"
 )
-assert "extra.txt" in out42 and "nuevo" in out42, f"F1/R1: el resumen de apply no lista el archivo nuevo: {out42[:800]!r}"
+assert "extra.txt" in out42 and "new" in out42, f"F1/R1: el resumen de apply no lista el archivo nuevo: {out42[:800]!r}"
 shutil.rmtree(w42, ignore_errors=True)
 bump("42")
+
+# --- 43) review ronda 3: `apply` rechaza un ANCESTRO de HOME / Hermes home / root ---
+# The earlier checks refuse a target that IS one of those or lives UNDER them, so
+# "/" (and /Users) passed every one of them. With a tampered `<id>/original` the
+# explicit-deletion step would then remove every path in the target that is
+# missing from the copy — the whole personal tree. This case pins the new
+# ancestor refusal and checks that a legitimate project is still accepted.
+ws_b243 = make_ws({"keep.txt": "original\n"}, prefix="ws-b243-")
+env_b243 = provider.create_environment(cwd=str(ws_b243), timeout=15, task_id="b243")
+assert env_b243.execute("echo changed > injected.txt")["exit_code"] == 0
+sess43 = SB_ROOT / "b243"
+assert (sess43 / "workspace").is_dir() and (sess43 / "original").is_file(), "sesión b243 incompleta"
+
+_ancestors = ["/", str(Path.home().parent), str(Path(os.environ["HERMES_HOME"]).parent)]
+for dangerous in dict.fromkeys(_ancestors):  # dedupe, keep order
+    sess43.joinpath("original").write_text(dangerous, encoding="utf-8")
+    code43, out43 = run_sbctl_tty("apply", "b243", answer="s\n")
+    assert code43 != 0, f"F1/R3: apply con registro ancestro {dangerous!r} NO fue rechazado: {out43[:600]}"
+    assert "refusing to apply" in out43, f"F1/R3: rechazo sin mensaje para {dangerous!r}: {out43[:400]!r}"
+    assert "CONTAINS" in out43, f"F1/R3: el mensaje no dice que CONTIENE un protegido: {out43[:400]!r}"
+    assert (sess43 / "workspace").is_dir(), "F1/R3: el rechazo borró la sesión"
+    print(f"  (R3) ancestor {dangerous!r} -> rc={code43}: {out43.strip().splitlines()[0]}")
+# No over-refusal: a normal project directory still reaches the confirmation.
+sess43.joinpath("original").write_text(str(ws_b243), encoding="utf-8")
+code43b, out43b = run_sbctl_tty("apply", "b243", answer="n\n")  # cancel: guards must have passed
+assert "refusing" not in out43b, f"F1/R3: un ORIG legítimo fue rechazado: {out43b[:600]!r}"
+assert "Pending changes" in out43b, f"F1/R3: el apply legítimo no llegó a la vista: {out43b[:600]!r}"
+shutil.rmtree(ws_b243, ignore_errors=True)
+bump("43")
 
 # --- cleanup de temporales grandes (opcional, no destructivo) ---
 for d in (ws, ws_sym, ws_ok, ws_ft, ws_e, ws_fp, ws_fp2, ws_out, ws_in, ws_sec, ws_env, ws_big,

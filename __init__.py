@@ -153,12 +153,65 @@ _HONEST_NOTE = (
 )
 
 
+# ── Locale ───────────────────────────────────────────────────────────────────
+# English is the DEFAULT: the catalog is English-first. PREFLIGHT_LANG=es keeps
+# the original Spanish wording of the human-facing review. The security guards
+# and their refusal messages are English in both locales — they are diagnostic,
+# not conversational, and a reviewer should not have to translate a refusal.
+# bin/sandboxctl carries its own copy of the same table (the CLI must work with
+# the plugin NOT loaded): keep the two in sync.
+_MSG: dict[str, dict[str, str]] = {
+    "en": {
+        "new": "new",
+        "changed": "changed",
+        "changed_meta": "changed (size/mtime)",
+        "line_changed": "1 line changed",
+        "lines_changed": "{n} lines changed",
+        "deleted": "DELETED",
+        "perm": "permissions {before} -> {after}",
+        "perm_changed": "permissions (changed)",
+        "header": "\N{CLIPBOARD} Pending changes in '{name}'  ({total} {word} "
+                  "+{new} ~{edit} -{deleted}{perms})",
+        "file_one": "file:",
+        "file_many": "files:",
+        "no_changes": "   (no changes vs. the real workspace)",
+        "more": "   \N{HORIZONTAL ELLIPSIS} and {n} more files "
+                "(see the full diff for the complete list)",
+    },
+    "es": {
+        "new": "nuevo",
+        "changed": "cambiado",
+        "changed_meta": "cambiado (tama\u00f1o/fecha)",
+        "line_changed": "1 l\u00ednea cambiada",
+        "lines_changed": "{n} l\u00edneas cambiadas",
+        "deleted": "BORRADO",
+        "perm": "permisos {before} \u2192 {after}",
+        "perm_changed": "permisos (cambiados)",
+        "header": "\N{CLIPBOARD} Cambios pendientes en '{name}'  ({total} {word} "
+                  "+{new} ~{edit} -{deleted}{perms})",
+        "file_one": "archivo:",
+        "file_many": "archivos:",
+        "no_changes": "   (sin cambios respecto al workspace real)",
+        "more": "   \N{HORIZONTAL ELLIPSIS} y {n} archivos m\u00e1s "
+                "(ver el diff completo para la lista entera)",
+    },
+}
+
+
+def _m(key: str, **kw: object) -> str:
+    """Message ``key`` in the active locale (English unless PREFLIGHT_LANG=es)."""
+    lang = (os.environ.get("PREFLIGHT_LANG") or "en").strip().lower()
+    table = _MSG["es"] if lang.startswith("es") else _MSG["en"]
+    return table.get(key, _MSG["en"].get(key, key)).format(**kw)
+
+
 def _expand_var_tokens(token: str, env: dict) -> str:
     """Best-effort ``$VAR``/``${VAR}`` expansion for UNSET/EMPTY variables.
 
-    The path guards must judge ``cat $EMPTY/etc/passwd`` the way bash will run
-    it: EMPTY is unset, so bash sees ``/etc/passwd`` — and the guard must see
-    the same. We expand ONLY variables that are absent or empty in the child's
+    The path guards must judge ``cat $EMPTY/<absolute system path>`` the way
+    bash will run it: EMPTY is unset, so bash sees an absolute path to a system
+    file — and the guard must see the same. We expand ONLY variables that are
+    absent or empty in the child's
     env (they expand to the empty string exactly like bash without ``set -u``
     does, which turns an absolute-looking residue into a real absolute path).
 
@@ -543,22 +596,22 @@ def build_review_summary(original: Path, sandbox: Path, *, label: str | None = N
         if rel in deleted:
             continue
         if not (original / rel).exists():
-            rows.append(("➕", rel, "nuevo"))
+            rows.append(("\u2795", rel, _m("new")))
             continue
         n = stats.get(rel, 0)
         if not n:
-            detail = "cambiado"
+            detail = _m("changed")
         else:
-            detail = "1 línea cambiada" if n == 1 else f"{n} líneas cambiadas"
-        rows.append(("✏️", rel, detail))
+            detail = _m("line_changed") if n == 1 else _m("lines_changed", n=n)
+        rows.append(("\u270f\ufe0f", rel, detail))
     for rel in only_meta:
         if rel in deleted or rel in stats:
             continue
-        rows.append(("✏️", rel, "cambiado (tamaño/fecha)"))
+        rows.append(("\u270f\ufe0f", rel, _m("changed_meta")))
     for rel in perms:
-        rows.append(("🔒", rel, _describe_mode_change(original, sandbox, rel)))
+        rows.append(("\U0001f512", rel, _describe_mode_change(original, sandbox, rel)))
     for rel in deleted:
-        rows.append(("❌", rel, "BORRADO"))
+        rows.append(("\u274c", rel, _m("deleted")))
 
     # Stable order: created/edited, permissions, deletions last (so a deletion
     # never hides behind the fold).
@@ -572,25 +625,23 @@ def build_review_summary(original: Path, sandbox: Path, *, label: str | None = N
     total = len({r[1] for r in rows})
 
     width = max([len(r[1]) for r in rows] + [8])
-    suffix = "archivo:" if total == 1 else "archivos:"
     lines = [
-        f"📋 Cambios pendientes en '{name}'  ({total} {suffix} "
-        f"+{n_new} ~{n_edit} -{n_del}" + (f" 🔒{n_perm}" if n_perm else "") + ")",
+        _m("header", name=name, total=total,
+           word=_m("file_one") if total == 1 else _m("file_many"),
+           new=n_new, edit=n_edit, deleted=n_del,
+           perms=f" \U0001f512{n_perm}" if n_perm else ""),
     ]
     if not rows:
-        lines.append("   (sin cambios respecto al workspace real)")
+        lines.append(_m("no_changes"))
     for icon, rel, detail in rows[:_SUMMARY_MAX_FILES]:
         lines.append(f"   {icon} {rel:<{width}}  {detail}")
     if total > _SUMMARY_MAX_FILES:
-        lines.append(
-            f"   … y {total - _SUMMARY_MAX_FILES} archivos más "
-            f"(ver el diff completo para la lista entera)"
-        )
+        lines.append(_m("more", n=total - _SUMMARY_MAX_FILES))
     return lines
 
 
 def _describe_mode_change(original: Path, sandbox: Path, rel: str) -> str:
-    """``permisos 755 → 600`` for a permission-only change."""
+    """``permissions 755 -> 600`` for a permission-only change."""
     def mode_of(base: Path):
         try:
             return oct(base.joinpath(rel).stat().st_mode & 0o777)[2:]
@@ -599,8 +650,8 @@ def _describe_mode_change(original: Path, sandbox: Path, rel: str) -> str:
 
     before, after = mode_of(original), mode_of(sandbox)
     if before and after and before != after:
-        return f"permisos {before} → {after}"
-    return "permisos (cambiados)"
+        return _m("perm", before=before, after=after)
+    return _m("perm_changed")
 
 
 def _write_original_fingerprint(original: Path, dst: Path) -> None:
@@ -720,8 +771,9 @@ class PreflightEnvironment:
 
         Not a real sandbox (the shell runs on the host), so this guard is an
         honest safety net, not an impenetrable wall. Variables are expanded
-        against the child's env FIRST, so ``cat $EMPTY/etc/passwd`` (EMPTY
-        unset -> ``/etc/passwd``) is judged the way bash will run it, while
+        against the child's env FIRST, so ``cat $EMPTY/<absolute system path>``
+        (EMPTY unset -> an absolute path to a system file) is judged the way bash
+        will run it, while
         ``$HOME`` / ``$TMPDIR`` (pinned to the copy) stay inside.
 
         A path that points INSIDE the sandbox root but outside this session's
@@ -781,8 +833,9 @@ class PreflightEnvironment:
         contains a ``/``, plus a bare ``..`` — is resolved against the copy's
         cwd: if the resolved candidate leaves the cwd, the token is blocked.
         This catches foreign-``..`` traversal such as ``a/../../x.txt`` (the
-        token does not start with ``.`` but still escapes) and ``cat
-        a/../../../etc/passwd``. ``..`` segments that stay inside the copy
+        token does not start with ``.`` but still escapes) and a run of ``..``
+        segments reaching a system file outside the copy. ``..`` segments that
+        stay inside the copy
         (e.g. ``../peer`` where ``peer`` is a sibling inside the workspace) are
         allowed. Tokens without a path separator cannot escape by resolution
         and are skipped (a bare ``..`` is the single no-slash escape, handled

@@ -1,5 +1,5 @@
 name: preflight
-version: 0.1.0
+version: 0.1.2
 description: "Preflight dry-run gate: runs each command in a throwaway workspace copy, shows the exact diff, and applies only what you explicitly approve. The copy is not a kernel sandbox - see README 'Honest limitations'."
 requires_hermes: ">=0.22.0"
 kind: backend
